@@ -1,0 +1,7 @@
+{
+  "name": "hackernews",
+  "goal": "give agents focused access to top stories and item lookup",
+  "sourceType": "docs",
+  "source": "https://github.com/HackerNews/API",
+  "functions": ["top_stories", "get_item", "search_cached_stories"]
+}

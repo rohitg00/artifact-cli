@@ -1,0 +1,37 @@
+{
+  "name": "artifact-cli",
+  "version": "0.1.0",
+  "description": "Turn APIs, specs, docs, and workflow artifacts into narrowly scoped iii workers.",
+  "type": "module",
+  "private": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/workers/artifact-cli-worker/src/worker.js",
+    "dev": "tsx workers/artifact-cli-worker/src/worker.ts",
+    "test": "tsx tests/smoke.test.ts"
+  },
+  "dependencies": {
+    "iii-sdk": "latest",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "keywords": [
+    "iii",
+    "worker",
+    "agents",
+    "cli",
+    "mcp",
+    "codegen",
+    "artifact"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rohitg00/artifact-cli.git"
+  }
+}

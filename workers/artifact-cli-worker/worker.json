@@ -1,0 +1,13 @@
+{
+  "name": "artifact-cli-worker",
+  "description": "Plan and generate narrowly scoped iii workers from API/spec/doc artifacts.",
+  "runtime": "node",
+  "start": "npm run dev",
+  "functions": [
+    "artifact::inspect",
+    "artifact::plan_worker",
+    "artifact::generate_worker",
+    "artifact::verify_worker",
+    "artifact::manifest"
+  ]
+}
