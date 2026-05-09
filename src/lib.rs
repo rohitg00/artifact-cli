@@ -147,6 +147,7 @@ pub fn worker_metadata() -> WorkerMetadata {
         ),
         pid: Some(std::process::id()),
         telemetry: None,
+        isolation: None,
     }
 }
 
@@ -441,7 +442,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
-iii-sdk = "0.12.0-next.1"
+iii-sdk = "0.11.6"
 schemars = "0.8"
 serde = {{ version = "1.0", features = ["derive"] }}
 serde_json = "1.0"
