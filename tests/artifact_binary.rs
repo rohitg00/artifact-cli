@@ -53,6 +53,32 @@ fn artifact_catalog_prints_reusable_worker_catalog() {
 }
 
 #[test]
+fn artifact_recipes_prints_worker_recipe_catalog() {
+    let output = Command::new(env!("CARGO_BIN_EXE_artifact"))
+        .arg("recipes")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|recipe| recipe["name"] == "producthunt"));
+    assert!(value
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|recipe| recipe["name"] == "linear"));
+}
+
+#[test]
 fn artifact_from_derives_leaf_name_from_github_tree_source() {
     let output = Command::new(env!("CARGO_BIN_EXE_artifact"))
         .args([

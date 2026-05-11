@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 pub type Result<T> = std::result::Result<T, ArtifactError>;
 
 pub const WORKER_NAME: &str = "artifact-cli-worker";
-pub const ARTIFACT_FUNCTION_IDS: [&str; 6] = [
+pub const ARTIFACT_FUNCTION_IDS: [&str; 7] = [
     "artifact::catalog",
+    "artifact::recipes",
     "artifact::inspect",
     "artifact::plan_worker",
     "artifact::generate_worker",
@@ -79,6 +80,16 @@ pub struct ReusableWorker {
 pub struct WorkerCatalog {
     pub engine_builtins: Vec<ReusableWorker>,
     pub installable_workers: Vec<ReusableWorker>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerRecipe {
+    pub name: String,
+    pub category: String,
+    pub goal: String,
+    pub source_hints: Vec<String>,
+    pub default_functions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -214,6 +225,13 @@ pub fn register_artifact_primitives(iii: &iii_sdk::III) -> Vec<FunctionRef> {
             ),
         ),
         iii.register_function(
+            RegisterFunction::new(
+                "artifact::recipes",
+                |_payload: serde_json::Value| -> Result<Vec<WorkerRecipe>> { Ok(worker_recipes()) },
+            )
+            .description("List narrow worker recipes artifact-cli can generate."),
+        ),
+        iii.register_function(
             RegisterFunction::new("artifact::inspect", inspect_artifact)
                 .description("Inspect an artifact source and suggest narrow iii worker functions."),
         ),
@@ -241,6 +259,161 @@ pub fn worker_catalog() -> WorkerCatalog {
         engine_builtins: engine_builtin_catalog(),
         installable_workers: installable_worker_catalog(),
     }
+}
+
+pub fn worker_recipes() -> Vec<WorkerRecipe> {
+    vec![
+        worker_recipe(
+            "digg",
+            "media",
+            "Answer top stories, AI 1000 rank lookup, story search, highlights, and pipeline status.",
+            &["digg", "di.gg", "ai 1000"],
+            &[
+                "top_stories",
+                "author_rank",
+                "search_stories",
+                "story_highlights",
+                "pipeline_status",
+            ],
+        ),
+        worker_recipe(
+            "hackernews",
+            "media",
+            "Give agents focused access to top stories, item lookup, and cached story search.",
+            &["hackernews", "hacker news", "news.ycombinator", "hn.algolia"],
+            &["top_stories", "get_item", "search_cached_stories"],
+        ),
+        worker_recipe(
+            "producthunt",
+            "marketing",
+            "Track launches, maker profiles, topic search, and launch momentum.",
+            &["producthunt", "product hunt"],
+            &[
+                "top_launches",
+                "launch_details",
+                "maker_lookup",
+                "topic_search",
+                "launch_metrics",
+            ],
+        ),
+        worker_recipe(
+            "linear",
+            "project_management",
+            "Summarize blocked work, stale issues, cycle risk, issue search, and team load.",
+            &["linear", "linear.app"],
+            &[
+                "blocked_issues",
+                "stale_issues",
+                "cycle_risk",
+                "issue_search",
+                "team_workload",
+            ],
+        ),
+        worker_recipe(
+            "github_repo",
+            "developer_tools",
+            "Summarize repo health, stale PRs, open issues, releases, and failing checks.",
+            &["github repo", "pull request", "github.com"],
+            &[
+                "repo_summary",
+                "stale_prs",
+                "open_issues",
+                "release_notes",
+                "ci_failures",
+            ],
+        ),
+        worker_recipe(
+            "stripe",
+            "payments",
+            "Inspect customer health, subscription risk, failed payments, invoices, and revenue snapshots.",
+            &["stripe"],
+            &[
+                "customer_summary",
+                "subscription_risk",
+                "failed_payments",
+                "invoice_lookup",
+                "revenue_snapshot",
+            ],
+        ),
+        worker_recipe(
+            "arxiv",
+            "research",
+            "Search papers, summarize findings, inspect author trends, and build citation packs.",
+            &["arxiv", "arxiv.org"],
+            &[
+                "search_papers",
+                "paper_summary",
+                "author_trends",
+                "related_papers",
+                "citation_pack",
+            ],
+        ),
+        worker_recipe(
+            "wikipedia",
+            "knowledge",
+            "Summarize pages, search topics, read sections, cite sources, and compare pages.",
+            &["wikipedia", "wikimedia"],
+            &[
+                "article_summary",
+                "topic_search",
+                "page_sections",
+                "citations",
+                "compare_pages",
+            ],
+        ),
+        worker_recipe(
+            "sentry",
+            "monitoring",
+            "Summarize production issues, release regressions, trends, suspect commits, and alerts.",
+            &["sentry"],
+            &[
+                "issue_summary",
+                "release_regressions",
+                "error_trends",
+                "suspect_commits",
+                "alert_digest",
+            ],
+        ),
+        worker_recipe(
+            "slack",
+            "productivity",
+            "Search channels, summarize threads, extract decisions, and prepare follow-ups.",
+            &["slack"],
+            &[
+                "channel_search",
+                "thread_summary",
+                "decision_digest",
+                "followups",
+                "user_context",
+            ],
+        ),
+        worker_recipe(
+            "notion",
+            "productivity",
+            "Search workspace knowledge, summarize pages, inspect databases, and create update briefs.",
+            &["notion"],
+            &[
+                "workspace_search",
+                "page_summary",
+                "database_query",
+                "decision_log",
+                "update_brief",
+            ],
+        ),
+        worker_recipe(
+            "openrouter",
+            "ai",
+            "Compare model availability, pricing, capabilities, and routing fit.",
+            &["openrouter"],
+            &[
+                "model_search",
+                "model_compare",
+                "pricing_lookup",
+                "capability_filter",
+                "routing_recommendation",
+            ],
+        ),
+    ]
 }
 
 pub fn inspect_artifact(input: ArtifactInput) -> Result<InspectResult> {
@@ -685,6 +858,25 @@ fn reusable_worker(
     }
 }
 
+fn worker_recipe(
+    name: &str,
+    category: &str,
+    goal: &str,
+    source_hints: &[&str],
+    default_functions: &[&str],
+) -> WorkerRecipe {
+    WorkerRecipe {
+        name: name.into(),
+        category: category.into(),
+        goal: goal.into(),
+        source_hints: source_hints.iter().map(|value| (*value).into()).collect(),
+        default_functions: default_functions
+            .iter()
+            .map(|value| (*value).into())
+            .collect(),
+    }
+}
+
 fn plan_reuse(input: &ArtifactInput, functions: &[String]) -> ReusePlan {
     let capabilities = infer_capabilities(input, functions);
     let engine_builtins = engine_builtin_catalog()
@@ -884,14 +1076,8 @@ fn infer_functions(input: &ArtifactInput) -> Vec<String> {
     .to_lowercase();
 
     let name = input.name.to_lowercase();
-    if name == "digg" || haystack.contains("digg") || haystack.contains("di.gg") {
-        return vec![
-            "top_stories".into(),
-            "author_rank".into(),
-            "search_stories".into(),
-            "story_highlights".into(),
-            "pipeline_status".into(),
-        ];
+    if let Some(recipe) = matching_recipe(&name, &haystack) {
+        return recipe.default_functions;
     }
     if name.contains("hackernews") || name == "hn" || haystack.contains("top stories") {
         return vec![
@@ -923,6 +1109,16 @@ fn infer_functions(input: &ArtifactInput) -> Vec<String> {
         ];
     }
     vec!["inspect".into(), "list".into(), "get".into()]
+}
+
+fn matching_recipe(name: &str, haystack: &str) -> Option<WorkerRecipe> {
+    worker_recipes().into_iter().find(|recipe| {
+        recipe.name == name
+            || recipe.source_hints.iter().any(|hint| {
+                let hint = hint.to_lowercase();
+                name.contains(&hint) || haystack.contains(&hint)
+            })
+    })
 }
 
 fn plan_function(namespace: &str, function: &str) -> WorkerFunctionPlan {

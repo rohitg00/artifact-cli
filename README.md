@@ -53,6 +53,7 @@ The primary CLI is the human doorway. It generates workers, verifies them, print
 
 ```bash
 cargo run --bin artifact -- catalog
+cargo run --bin artifact -- recipes
 
 cargo run --bin artifact -- from https://github.com/HackerNews/API \
   --goal "give agents focused access to top stories and item lookup" \
@@ -77,6 +78,8 @@ cargo run --bin artifact -- generate \
   --payload examples/digg.payload.json \
   --out ./generated/digg-worker
 ```
+
+Other seeded recipes include Product Hunt, Hacker News, Linear, GitHub repo risk, Stripe, arXiv, Wikipedia, Sentry, Slack, Notion, and OpenRouter.
 
 Preview the iii manifest:
 

@@ -1,7 +1,7 @@
 use artifact_cli::{
     artifact_manifest, generate_worker, init_options, inspect_artifact, plan_worker,
-    register_artifact_primitives, verify_worker, worker_catalog, ArtifactInput, SourceType,
-    VerifyWorkerInput,
+    register_artifact_primitives, verify_worker, worker_catalog, worker_recipes, ArtifactInput,
+    SourceType, VerifyWorkerInput,
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -17,6 +17,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Catalog,
+    Recipes,
     Inspect(ArtifactArgs),
     Plan(ArtifactArgs),
     Manifest(ArtifactArgs),
@@ -70,6 +71,9 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Catalog => {
             println!("{}", serde_json::to_string_pretty(&worker_catalog())?);
+        }
+        Command::Recipes => {
+            println!("{}", serde_json::to_string_pretty(&worker_recipes())?);
         }
         Command::Inspect(args) => {
             println!(

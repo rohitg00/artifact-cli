@@ -1,7 +1,7 @@
 use artifact_cli::{
     artifact_manifest, generate_worker, inspect_artifact, install_plan, plan_worker,
-    registered_function_ids, verify_worker, worker_catalog, worker_metadata, ArtifactInput,
-    SourceType, VerifyWorkerInput,
+    registered_function_ids, verify_worker, worker_catalog, worker_metadata, worker_recipes,
+    ArtifactInput, SourceType, VerifyWorkerInput,
 };
 
 #[test]
@@ -110,6 +110,59 @@ fn infers_narrow_digg_worker_from_artifact_source() {
 }
 
 #[test]
+fn recipe_catalog_seeds_core_worker_targets() {
+    let recipes = worker_recipes();
+
+    for name in [
+        "digg",
+        "hackernews",
+        "producthunt",
+        "linear",
+        "github_repo",
+        "stripe",
+        "arxiv",
+        "wikipedia",
+        "sentry",
+        "slack",
+        "notion",
+        "openrouter",
+    ] {
+        assert!(recipes.iter().any(|recipe| recipe.name == name), "{name}");
+    }
+}
+
+#[test]
+fn infers_producthunt_and_linear_from_recipe_catalog() {
+    let producthunt = plan_worker(ArtifactInput {
+        name: "producthunt".into(),
+        goal: Some("daily launch tracking and maker lookup".into()),
+        source_type: Some(SourceType::Docs),
+        source: Some("https://www.producthunt.com".into()),
+        functions: vec![],
+        output_dir: None,
+    })
+    .unwrap();
+    assert!(producthunt
+        .functions
+        .iter()
+        .any(|function| function.function_id == "producthunt::launch_metrics"));
+
+    let linear = plan_worker(ArtifactInput {
+        name: "linear".into(),
+        goal: Some("blocked issues and cycle risk".into()),
+        source_type: Some(SourceType::OpenApi),
+        source: Some("https://linear.app".into()),
+        functions: vec![],
+        output_dir: None,
+    })
+    .unwrap();
+    assert!(linear
+        .functions
+        .iter()
+        .any(|function| function.function_id == "linear::cycle_risk"));
+}
+
+#[test]
 fn manifest_matches_old_artifact_manifest_function_surface() {
     let input = ArtifactInput {
         name: "hackernews".into(),
@@ -139,6 +192,7 @@ fn exposes_the_same_artifact_function_ids_as_iii_primitives() {
         registered_function_ids(),
         vec![
             "artifact::catalog",
+            "artifact::recipes",
             "artifact::inspect",
             "artifact::plan_worker",
             "artifact::generate_worker",
