@@ -1,0 +1,7 @@
+{
+  "name": "linear",
+  "goal": "give agents focused access to blocked issues, stale issues, cycle risk, issue search, and team workload",
+  "sourceType": "open_api",
+  "source": "https://linear.app",
+  "functions": []
+}

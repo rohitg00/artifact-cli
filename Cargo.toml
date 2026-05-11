@@ -14,6 +14,10 @@ path = "src/lib.rs"
 name = "artifact-cli-worker"
 path = "src/bin/artifact-cli-worker.rs"
 
+[[bin]]
+name = "artifact"
+path = "src/bin/artifact.rs"
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "env"] }
