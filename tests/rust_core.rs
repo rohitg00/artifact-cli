@@ -81,6 +81,35 @@ fn infers_hackernews_functions_from_name_before_source_url_noise() {
 }
 
 #[test]
+fn infers_narrow_digg_worker_from_artifact_source() {
+    let input = ArtifactInput {
+        name: "digg".into(),
+        goal: Some("rank lookup, top stories, story highlights, and pipeline status".into()),
+        source_type: Some(SourceType::Docs),
+        source: Some("https://di.gg/ai".into()),
+        functions: vec![],
+        output_dir: None,
+    };
+
+    let plan = plan_worker(input).unwrap();
+
+    assert_eq!(plan.worker_name, "digg-worker");
+    assert_eq!(plan.functions.len(), 5);
+    assert!(plan
+        .functions
+        .iter()
+        .any(|function| function.function_id == "digg::author_rank"
+            && function.purpose.contains("AI 1000")));
+    assert!(plan
+        .functions
+        .iter()
+        .any(|function| function.function_id == "digg::pipeline_status"));
+    assert!(plan.uses_workers.contains(&"iii-database".to_string()));
+    assert!(plan.uses_workers.contains(&"iii-rest".to_string()));
+    assert!(!plan.uses_workers.contains(&"auth-credentials".to_string()));
+}
+
+#[test]
 fn manifest_matches_old_artifact_manifest_function_surface() {
     let input = ArtifactInput {
         name: "hackernews".into(),

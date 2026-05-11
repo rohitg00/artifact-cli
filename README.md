@@ -67,6 +67,17 @@ cargo run --bin artifact -- generate \
   --out ./generated/hackernews-worker
 ```
 
+Try the Digg AI example:
+
+```bash
+cargo run --bin artifact -- from https://di.gg/ai \
+  --goal "answer rank lookup, top stories, story highlights, search, and pipeline status"
+
+cargo run --bin artifact -- generate \
+  --payload examples/digg.payload.json \
+  --out ./generated/digg-worker
+```
+
 Preview the iii manifest:
 
 ```bash

@@ -51,3 +51,26 @@ fn artifact_catalog_prints_reusable_worker_catalog() {
         .iter()
         .any(|worker| worker["name"] == "iii-database"));
 }
+
+#[test]
+fn artifact_from_derives_leaf_name_from_github_tree_source() {
+    let output = Command::new(env!("CARGO_BIN_EXE_artifact"))
+        .args([
+            "from",
+            "https://github.com/example/library/tree/main/media/digg",
+            "--goal",
+            "rank lookup and top stories",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["workerName"], "digg-worker");
+    assert_eq!(value["functions"][1]["functionId"], "digg::author_rank");
+}

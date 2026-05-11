@@ -525,7 +525,7 @@ fn installable_worker_catalog() -> Vec<ReusableWorker> {
             "iii-hq/workers",
             Some("iii worker add auth-credentials"),
             "Store API keys and OAuth tokens for generated workers.",
-            &["credentials", "auth", "oauth", "external_api"],
+            &["credentials", "auth", "oauth"],
             &["auth::set", "auth::get", "auth::list", "auth::clear", "auth::resolve"],
         ),
         reusable_worker(
@@ -729,10 +729,20 @@ fn infer_capabilities(input: &ArtifactInput, functions: &[String]) -> Vec<String
     )
     .to_lowercase();
 
+    let public_digg = contains_any(
+        &haystack,
+        &[
+            "digg",
+            "di.gg",
+            "ai 1000",
+            "leaderboard",
+            "pipeline status",
+            "top stories",
+        ],
+    );
+
     match source_type {
         SourceType::OpenApi | SourceType::Graphql | SourceType::Har | SourceType::Url => {
-            push_unique(&mut capabilities, "external_api");
-            push_unique(&mut capabilities, "credentials");
             push_unique(&mut capabilities, "http");
         }
         SourceType::Docs | SourceType::Manual => {
@@ -811,6 +821,26 @@ fn infer_capabilities(input: &ArtifactInput, functions: &[String]) -> Vec<String
     ) {
         push_unique(&mut capabilities, "policy");
     }
+    if !public_digg
+        && contains_any(
+            &haystack,
+            &[
+                "oauth",
+                "token",
+                "api key",
+                "credential",
+                "github",
+                "linear",
+                "jira",
+            ],
+        )
+    {
+        push_unique(&mut capabilities, "credentials");
+    }
+    if public_digg {
+        push_unique(&mut capabilities, "http");
+        push_unique(&mut capabilities, "database");
+    }
 
     capabilities
 }
@@ -854,6 +884,15 @@ fn infer_functions(input: &ArtifactInput) -> Vec<String> {
     .to_lowercase();
 
     let name = input.name.to_lowercase();
+    if name == "digg" || haystack.contains("digg") || haystack.contains("di.gg") {
+        return vec![
+            "top_stories".into(),
+            "author_rank".into(),
+            "search_stories".into(),
+            "story_highlights".into(),
+            "pipeline_status".into(),
+        ];
+    }
     if name.contains("hackernews") || name == "hn" || haystack.contains("top stories") {
         return vec![
             "top_stories".into(),
@@ -889,6 +928,9 @@ fn infer_functions(input: &ArtifactInput) -> Vec<String> {
 fn plan_function(namespace: &str, function: &str) -> WorkerFunctionPlan {
     let clean = slugify(function);
     let sync_like = clean.contains("sync") || clean.contains("refresh");
+    if namespace == "digg" {
+        return plan_digg_function(namespace, &clean);
+    }
     WorkerFunctionPlan {
         function_id: format!("{}::{}", namespace, clean),
         purpose: format!("{} for the {} worker", titleize(&clean), namespace),
@@ -907,6 +949,49 @@ fn plan_function(namespace: &str, function: &str) -> WorkerFunctionPlan {
             "data": "function-specific result payload",
             "sources": "optional source/provenance list"
         }),
+    }
+}
+
+fn plan_digg_function(namespace: &str, function: &str) -> WorkerFunctionPlan {
+    let (purpose, inputs, output) = match function {
+        "top_stories" => (
+            "Return the current top Digg AI story clusters for agent summaries.",
+            serde_json::json!({ "limit": "number optional; default 10", "window": "string optional; today|24h|7d" }),
+            serde_json::json!({ "stories": "ranked clusters with title, rank, url id, authors, and citation links" }),
+        ),
+        "author_rank" => (
+            "Look up a person or X handle in the Digg AI 1000 and explain rank or off-list gap.",
+            serde_json::json!({ "handle": "string optional; X handle", "name": "string optional; person name" }),
+            serde_json::json!({ "author": "rank, handle, category, peer-follow count, nearest rank anchor, and gap when off-list" }),
+        ),
+        "search_stories" => (
+            "Search Digg AI story clusters by topic with citations.",
+            serde_json::json!({ "query": "string topic", "since": "string optional duration like 24h or 7d", "limit": "number optional" }),
+            serde_json::json!({ "matches": "ranked clusters with title, rank, post count, authors, and cluster url id" }),
+        ),
+        "story_highlights" => (
+            "Summarize notable AI 1000 posts and replies for a story or post URL.",
+            serde_json::json!({ "clusterUrlId": "string optional", "postUrl": "string optional", "handle": "string optional" }),
+            serde_json::json!({ "highlights": "quoted or paraphrased notable posts with author rank and source URLs" }),
+        ),
+        "pipeline_status" => (
+            "Read public Digg AI ingestion status and recent pipeline events.",
+            serde_json::json!({ "watch": "boolean optional", "since": "string optional duration" }),
+            serde_json::json!({ "status": "isFetching, nextFetchAt, storiesToday, clustersToday, recent events" }),
+        ),
+        _ => (
+            "Handle a focused Digg AI read-only query.",
+            serde_json::json!({ "query": "string/object; focused request payload" }),
+            serde_json::json!({ "ok": "boolean", "data": "Digg AI result payload", "sources": "citations" }),
+        ),
+    };
+
+    WorkerFunctionPlan {
+        function_id: format!("{}::{}", namespace, function),
+        purpose: purpose.into(),
+        side_effects: SideEffects::ExternalCall,
+        inputs,
+        output,
     }
 }
 

@@ -162,6 +162,10 @@ fn infer_name_from_source(source: &str) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
 
+    if parts.len() >= 5 && parts[0].contains("github.com") && matches!(parts[3], "tree" | "blob") {
+        return parts.last().copied().unwrap_or("artifact").to_string();
+    }
+
     if parts.len() >= 3 && parts[0].contains("github.com") {
         return format!("{}-{}", parts[1], parts[2]);
     }
