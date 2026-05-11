@@ -1,6 +1,7 @@
 use artifact_cli::{
-    artifact_manifest, generate_worker, inspect_artifact, plan_worker, registered_function_ids,
-    verify_worker, worker_catalog, worker_metadata, ArtifactInput, SourceType, VerifyWorkerInput,
+    artifact_manifest, generate_worker, inspect_artifact, install_plan, plan_worker,
+    registered_function_ids, verify_worker, worker_catalog, worker_metadata, ArtifactInput,
+    SourceType, VerifyWorkerInput,
 };
 
 #[test]
@@ -182,4 +183,16 @@ fn generates_and_verifies_rust_worker_scaffold_using_iii_sdk_apis() {
     assert!(verified.ok, "missing: {:?}", verified.missing_registrations);
     assert_eq!(verified.function_count, 2);
     assert!(verified.missing_files.is_empty());
+
+    let install = install_plan(tmp.path()).unwrap();
+    assert!(install.ok);
+    assert_eq!(install.worker_name, "hackernews-worker");
+    assert!(install
+        .commands
+        .iter()
+        .any(|command| command == "iii worker add shell-filesystem"));
+    assert!(install
+        .commands
+        .iter()
+        .any(|command| command.contains("cargo build --release")));
 }

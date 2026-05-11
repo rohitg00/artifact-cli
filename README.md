@@ -49,35 +49,46 @@ Run it as a live iii worker:
 cargo run --bin artifact-cli-worker -- serve --iii-url ws://localhost:49134
 ```
 
-The CLI binary exposes matching local commands:
+The primary CLI is the human doorway. It generates workers, verifies them, prints install commands, and can call registered iii functions:
 
 ```bash
-cargo run --bin artifact-cli-worker -- catalog
+cargo run --bin artifact -- catalog
 
-cargo run --bin artifact-cli-worker -- plan \
-  --name hackernews \
+cargo run --bin artifact -- from https://github.com/HackerNews/API \
   --goal "give agents focused access to top stories and item lookup" \
-  --source https://github.com/HackerNews/API
+  --source-type docs
 ```
 
 Generate a Rust worker scaffold from a JSON payload:
 
 ```bash
-cargo run --bin artifact-cli-worker -- generate \
+cargo run --bin artifact -- generate \
   --payload examples/hackernews.payload.json \
-  --output-dir ./generated/hackernews-worker
+  --out ./generated/hackernews-worker
 ```
 
 Preview the iii manifest:
 
 ```bash
-cargo run --bin artifact-cli-worker -- manifest --payload examples/hackernews.payload.json
+cargo run --bin artifact -- manifest --payload examples/hackernews.payload.json
 ```
 
 Verify it:
 
 ```bash
-cargo run --bin artifact-cli-worker -- verify --output-dir ./generated/hackernews-worker
+cargo run --bin artifact -- verify ./generated/hackernews-worker
+```
+
+Print the dependency/build/run plan:
+
+```bash
+cargo run --bin artifact -- install ./generated/hackernews-worker
+```
+
+Call a registered generated function:
+
+```bash
+cargo run --bin artifact -- call hackernews::top_stories --json '{"limit":10}'
 ```
 
 ## Generated worker shape
@@ -120,10 +131,10 @@ Each generated plan also includes:
 ```bash
 cargo fmt
 cargo test
-cargo run --bin artifact-cli-worker -- catalog
-cargo run --bin artifact-cli-worker -- plan --name hackernews
+cargo run --bin artifact -- catalog
+cargo run --bin artifact -- from https://github.com/HackerNews/API --goal "top stories"
 ```
 
 ## Status
 
-Production Rust worker. The binary can run as a live `iii-sdk` worker and register the full `artifact::*` function surface. Generated workers are also Rust and use `iii-sdk` registration APIs directly.
+Production Rust worker plus primary `artifact` CLI. `artifact-cli-worker` can run as a live `iii-sdk` worker and register the full `artifact::*` function surface. Generated workers are also Rust and use `iii-sdk` registration APIs directly.

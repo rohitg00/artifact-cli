@@ -156,6 +156,17 @@ pub struct ArtifactManifestPreview {
     pub reuse_plan: ReusePlan,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerInstallPlan {
+    pub ok: bool,
+    pub worker_name: String,
+    pub worker_dir: PathBuf,
+    pub dependencies: Vec<ReusableWorker>,
+    pub commands: Vec<String>,
+    pub verification: VerificationReport,
+}
+
 pub fn registered_function_ids() -> Vec<&'static str> {
     ARTIFACT_FUNCTION_IDS.to_vec()
 }
@@ -330,6 +341,51 @@ pub fn generate_worker(input: ArtifactInput) -> Result<GeneratedWorker> {
 
 pub fn verify_worker(input: VerifyWorkerInput) -> Result<VerificationReport> {
     verify_worker_dir(input.output_dir)
+}
+
+pub fn install_plan(output_dir: impl AsRef<Path>) -> Result<WorkerInstallPlan> {
+    let output_dir = output_dir.as_ref();
+    let verification = verify_worker_dir(output_dir)?;
+    let manifest_path = output_dir.join("artifact.manifest.json");
+    let plan = if manifest_path.exists() {
+        serde_json::from_str::<WorkerPlan>(&fs::read_to_string(&manifest_path)?)?
+    } else {
+        WorkerPlan {
+            worker_name: "unknown-worker".into(),
+            namespace: "unknown".into(),
+            source_type: SourceType::Manual,
+            source: None,
+            goal: "Unknown generated worker.".into(),
+            functions: Vec::new(),
+            uses_workers: Vec::new(),
+            reuse_plan: ReusePlan::default(),
+            notes: Vec::new(),
+        }
+    };
+    let mut commands = plan
+        .reuse_plan
+        .installable_workers
+        .iter()
+        .filter_map(|worker| worker.install.clone())
+        .collect::<Vec<_>>();
+    commands.push(format!(
+        "cd {} && cargo build --release",
+        output_dir.display()
+    ));
+    commands.push(format!(
+        "III_URL=ws://localhost:49134 {}/target/release/{}",
+        output_dir.display(),
+        plan.worker_name
+    ));
+
+    Ok(WorkerInstallPlan {
+        ok: verification.ok,
+        worker_name: plan.worker_name,
+        worker_dir: output_dir.to_path_buf(),
+        dependencies: plan.reuse_plan.installable_workers,
+        commands,
+        verification,
+    })
 }
 
 pub fn verify_worker_dir(output_dir: impl AsRef<Path>) -> Result<VerificationReport> {
