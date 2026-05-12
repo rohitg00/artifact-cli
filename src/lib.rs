@@ -1256,78 +1256,106 @@ fn matching_recipe(name: &str, haystack: &str) -> Option<WorkerRecipe> {
 fn plan_function(namespace: &str, function: &str) -> WorkerFunctionPlan {
     let clean = slugify(function);
     let sync_like = clean.contains("sync") || clean.contains("refresh");
-    if namespace == "digg" {
-        return plan_digg_function(namespace, &clean);
-    }
+    let top_like = clean.contains("top") || clean.contains("trend") || clean.contains("launch");
+    let search_like = clean.contains("search") || clean.contains("lookup");
+    let highlight_like = clean.contains("highlight")
+        || clean.contains("summary")
+        || clean.contains("brief")
+        || clean.contains("digest");
+    let rank_like = clean.contains("rank")
+        || clean.contains("author")
+        || clean.contains("maker")
+        || clean.contains("profile");
+    let status_like =
+        clean.contains("status") || clean.contains("pipeline") || clean.contains("health");
+    let (purpose, inputs, output) = if top_like {
+        (
+            format!(
+                "Return top {} items for agent summaries.",
+                titleize(namespace)
+            ),
+            serde_json::json!({ "limit": "number optional; default 10", "window": "string optional; today|24h|7d" }),
+            serde_json::json!({ "items": "ranked public items with title, summary, rank, and source URL" }),
+        )
+    } else if search_like {
+        (
+            format!("Search {} source data with citations.", titleize(namespace)),
+            serde_json::json!({ "query": "string topic", "limit": "number optional", "since": "string optional duration like 24h or 7d" }),
+            serde_json::json!({ "matches": "ranked matches with title, summary, and source URL" }),
+        )
+    } else if highlight_like {
+        (
+            format!(
+                "Create a concise {} highlight artifact from a URL or structured thread payload.",
+                titleize(namespace)
+            ),
+            serde_json::json!({ "url": "string optional", "id": "string optional", "threadId": "string optional", "prompt": "object optional", "replies": "array optional" }),
+            serde_json::json!({ "text": "monospace-friendly highlight artifact", "source": "source URL when fetched" }),
+        )
+    } else if rank_like {
+        (
+            format!(
+                "Look up a person, author, maker, or handle in {} source data.",
+                titleize(namespace)
+            ),
+            serde_json::json!({ "handle": "string optional", "name": "string optional", "query": "string optional" }),
+            serde_json::json!({ "match": "best matching public source line with context" }),
+        )
+    } else if status_like {
+        (
+            format!(
+                "Read {} public source status and recent visible signals.",
+                titleize(namespace)
+            ),
+            serde_json::json!({ "watch": "boolean optional", "since": "string optional duration" }),
+            serde_json::json!({ "status": "short source reachability/status summary" }),
+        )
+    } else if sync_like {
+        (
+            format!("Sync source data for the {} worker.", namespace),
+            serde_json::json!({ "force": "boolean optional; bypass cache when true" }),
+            serde_json::json!({ "ok": "boolean success flag", "synced": "sync result payload" }),
+        )
+    } else {
+        (
+            format!("{} for the {} worker", titleize(&clean), namespace),
+            serde_json::json!({ "query": "string/object; focused request payload for this function" }),
+            serde_json::json!({
+                "ok": "boolean success flag",
+                "data": "function-specific result payload",
+                "sources": "optional source/provenance list"
+            }),
+        )
+    };
+
     WorkerFunctionPlan {
         function_id: format!("{}::{}", namespace, clean),
-        purpose: format!("{} for the {} worker", titleize(&clean), namespace),
+        purpose,
         side_effects: if sync_like {
             SideEffects::Sync
         } else {
             SideEffects::ExternalCall
         },
-        inputs: if sync_like {
-            serde_json::json!({ "force": "boolean optional; bypass cache when true" })
-        } else {
-            serde_json::json!({ "query": "string/object; focused request payload for this function" })
-        },
-        output: serde_json::json!({
-            "ok": "boolean success flag",
-            "data": "function-specific result payload",
-            "sources": "optional source/provenance list"
-        }),
-    }
-}
-
-fn plan_digg_function(namespace: &str, function: &str) -> WorkerFunctionPlan {
-    let (purpose, inputs, output) = match function {
-        "top_stories" => (
-            "Return the current top Digg AI story clusters for agent summaries.",
-            serde_json::json!({ "limit": "number optional; default 10", "window": "string optional; today|24h|7d" }),
-            serde_json::json!({ "stories": "ranked clusters with title, rank, url id, authors, and citation links" }),
-        ),
-        "author_rank" => (
-            "Look up a person or X handle in the Digg AI 1000 and explain rank or off-list gap.",
-            serde_json::json!({ "handle": "string optional; X handle", "name": "string optional; person name" }),
-            serde_json::json!({ "author": "rank, handle, category, peer-follow count, nearest rank anchor, and gap when off-list" }),
-        ),
-        "search_stories" => (
-            "Search Digg AI story clusters by topic with citations.",
-            serde_json::json!({ "query": "string topic", "since": "string optional duration like 24h or 7d", "limit": "number optional" }),
-            serde_json::json!({ "matches": "ranked clusters with title, rank, post count, authors, and cluster url id" }),
-        ),
-        "story_highlights" => (
-            "Summarize notable AI 1000 posts and replies for a story or post URL.",
-            serde_json::json!({ "clusterUrlId": "string optional", "postUrl": "string optional", "handle": "string optional" }),
-            serde_json::json!({ "highlights": "quoted or paraphrased notable posts with author rank and source URLs" }),
-        ),
-        "pipeline_status" => (
-            "Read public Digg AI ingestion status and recent pipeline events.",
-            serde_json::json!({ "watch": "boolean optional", "since": "string optional duration" }),
-            serde_json::json!({ "status": "isFetching, nextFetchAt, storiesToday, clustersToday, recent events" }),
-        ),
-        _ => (
-            "Handle a focused Digg AI read-only query.",
-            serde_json::json!({ "query": "string/object; focused request payload" }),
-            serde_json::json!({ "ok": "boolean", "data": "Digg AI result payload", "sources": "citations" }),
-        ),
-    };
-
-    WorkerFunctionPlan {
-        function_id: format!("{}::{}", namespace, function),
-        purpose: purpose.into(),
-        side_effects: SideEffects::ExternalCall,
         inputs,
         output,
     }
 }
 
 fn render_worker_source(plan: &WorkerPlan) -> String {
-    if plan.namespace == "digg" {
-        return render_digg_worker_source(plan);
+    if uses_live_http_template(plan) {
+        return render_public_source_worker_source(plan);
     }
+    render_placeholder_worker_source(plan)
+}
 
+fn uses_live_http_template(plan: &WorkerPlan) -> bool {
+    plan.source
+        .as_deref()
+        .map(|source| source.starts_with("http://") || source.starts_with("https://"))
+        .unwrap_or(false)
+}
+
+fn render_placeholder_worker_source(plan: &WorkerPlan) -> String {
     let reused_workers = json_string_array(&plan.uses_workers);
     let registrations = plan
         .functions
@@ -1373,349 +1401,385 @@ fn main() {{
     )
 }
 
-fn render_digg_worker_source(plan: &WorkerPlan) -> String {
+fn render_public_source_worker_source(plan: &WorkerPlan) -> String {
     let reused_workers = json_string_array(&plan.uses_workers);
     let registrations = plan
         .functions
         .iter()
         .map(|function| {
+            let function_name = function
+                .function_id
+                .rsplit_once("::")
+                .map(|(_, name)| name)
+                .unwrap_or(function.function_id.as_str());
             format!(
                 r#"    iii.register_function(RegisterFunction::new("{function_id}", |payload: serde_json::Value| -> Result<serde_json::Value, String> {{
-        handle_digg_function("{function_id}", payload, serde_json::json!({reused_workers}))
+        handle_source_function("{function_id}", "{function_name}", payload, serde_json::json!({reused_workers}))
     }}).description("{purpose}"));
 "#,
                 function_id = function.function_id,
+                function_name = function_name,
                 purpose = function.purpose,
                 reused_workers = reused_workers
             )
         })
         .collect::<String>();
+    let source_url = serde_json::to_string(plan.source.as_deref().unwrap_or_default())
+        .unwrap_or_else(|_| "\"\"".into());
+    let source_name =
+        serde_json::to_string(&plan.namespace).unwrap_or_else(|_| "\"source\"".into());
 
-    format!(
-        r#"use iii_sdk::{{register_worker, InitOptions, RegisterFunction, RegisterServiceMessage}};
+    r#"use iii_sdk::{register_worker, InitOptions, RegisterFunction, RegisterServiceMessage};
 use serde_json::Value;
 
-const DIGG_AI_URL: &str = "https://di.gg/ai";
+const SOURCE_URL: &str = __SOURCE_URL__;
+const SOURCE_NAME: &str = __SOURCE_NAME__;
 
-fn main() {{
+fn main() {
     let engine_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
     let iii = register_worker(&engine_url, InitOptions::default());
-    iii.register_service(RegisterServiceMessage {{
-        id: "{worker_name}".into(),
-        name: "{worker_name}".into(),
+    iii.register_service(RegisterServiceMessage {
+        id: "__WORKER_NAME__".into(),
+        name: "__WORKER_NAME__".into(),
         description: Some("Generated artifact-cli Rust iii worker".into()),
         parent_service_id: None,
-    }});
-{registrations}    println!("{worker_name} registered functions against {{engine_url}}");
+    });
+__REGISTRATIONS__    println!("__WORKER_NAME__ registered functions against {engine_url}");
     std::thread::park();
     iii.shutdown();
-}}
+}
 
-fn handle_digg_function(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {{
-    match function_id {{
-        "digg::top_stories" => digg_top_stories(payload, reused_workers),
-        "digg::story_highlights" => digg_story_highlights(payload, reused_workers),
-        "digg::search_stories" => digg_search_stories(payload, reused_workers),
-        "digg::author_rank" => digg_author_rank(payload, reused_workers),
-        "digg::pipeline_status" => digg_pipeline_status(payload, reused_workers),
-        _ => Ok(serde_json::json!({{
-            "ok": true,
-            "functionId": function_id,
-            "payload": payload,
-            "reusedWorkers": reused_workers
-        }})),
-    }}
-}}
+fn handle_source_function(
+    function_id: &str,
+    function_name: &str,
+    payload: Value,
+    reused_workers: Value,
+) -> Result<Value, String> {
+    if has_thread_payload(&payload)
+        || function_name.contains("highlight")
+        || function_name.contains("summary")
+        || function_name.contains("brief")
+        || function_name.contains("digest")
+    {
+        return source_highlights(function_id, payload, reused_workers);
+    }
+    if function_name.contains("top")
+        || function_name.contains("trend")
+        || function_name.contains("launch")
+        || function_name.contains("list")
+    {
+        return source_top_items(function_id, payload, reused_workers);
+    }
+    if function_name.contains("search") {
+        return source_search(function_id, payload, reused_workers);
+    }
+    if function_name.contains("rank")
+        || function_name.contains("author")
+        || function_name.contains("maker")
+        || function_name.contains("profile")
+    {
+        return source_lookup(function_id, payload, reused_workers);
+    }
+    if function_name.contains("status")
+        || function_name.contains("pipeline")
+        || function_name.contains("health")
+    {
+        return source_status(function_id, payload, reused_workers);
+    }
+    source_lookup(function_id, payload, reused_workers)
+}
 
-fn digg_top_stories(payload: Value, reused_workers: Value) -> Result<Value, String> {{
+fn source_top_items(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
     let limit = payload_number(&payload, "limit").unwrap_or(10).clamp(1, 30) as usize;
-    let page = fetch_text(DIGG_AI_URL)?;
+    let page = fetch_text(SOURCE_URL)?;
     let text = readable_text(&page);
-    let stories = extract_story_summaries(&text, limit);
-    Ok(serde_json::json!({{
+    let items = extract_items(&text, limit);
+    Ok(serde_json::json!({
         "ok": true,
-        "functionId": "digg::top_stories",
-        "source": DIGG_AI_URL,
-        "stories": stories,
+        "functionId": function_id,
+        "source": SOURCE_URL,
+        "items": items,
         "reusedWorkers": reused_workers
-    }}))
-}}
+    }))
+}
 
-fn digg_search_stories(payload: Value, reused_workers: Value) -> Result<Value, String> {{
+fn source_search(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
     let query = payload_text(&payload, &["query", "q", "topic"]).unwrap_or_default().to_lowercase();
-    let page = fetch_text(DIGG_AI_URL)?;
+    let page = fetch_text(SOURCE_URL)?;
     let text = readable_text(&page);
-    let mut matches = extract_story_summaries(&text, 30)
+    let mut matches = extract_items(&text, 30)
         .into_iter()
-        .filter(|story| {{
-            if query.is_empty() {{
+        .filter(|item| {
+            if query.is_empty() {
                 true
-            }} else {{
-                story["title"].as_str().unwrap_or_default().to_lowercase().contains(&query)
-                    || story["summary"].as_str().unwrap_or_default().to_lowercase().contains(&query)
-            }}
-        }})
+            } else {
+                item["title"].as_str().unwrap_or_default().to_lowercase().contains(&query)
+                    || item["summary"].as_str().unwrap_or_default().to_lowercase().contains(&query)
+            }
+        })
         .collect::<Vec<_>>();
     let limit = payload_number(&payload, "limit").unwrap_or(10).clamp(1, 30) as usize;
     matches.truncate(limit);
-    Ok(serde_json::json!({{
+    Ok(serde_json::json!({
         "ok": true,
-        "functionId": "digg::search_stories",
+        "functionId": function_id,
         "query": query,
         "matches": matches,
-        "source": DIGG_AI_URL,
+        "source": SOURCE_URL,
         "reusedWorkers": reused_workers
-    }}))
-}}
+    }))
+}
 
-fn digg_story_highlights(payload: Value, reused_workers: Value) -> Result<Value, String> {{
-    if has_thread_payload(&payload) {{
-        let text = format_digg_thread_highlights(&payload);
-        return Ok(serde_json::json!({{
+fn source_highlights(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
+    if has_thread_payload(&payload) {
+        let text = format_thread_highlights(&payload);
+        return Ok(serde_json::json!({
             "ok": true,
-            "functionId": "digg::story_highlights",
+            "functionId": function_id,
             "mode": "thread_payload",
             "text": text,
             "reusedWorkers": reused_workers
-        }}));
-    }}
+        }));
+    }
 
-    let url = story_url(&payload);
+    let url = source_url(&payload);
     let page = fetch_text(&url)?;
     let text = readable_text(&page);
-    let title = first_story_title(&text).unwrap_or_else(|| "Digg AI story".into());
-    let summary = first_long_paragraph(&text, &title).unwrap_or_else(|| "No summary was found in the public story page.".into());
-    let mut actions = extract_ai1000_actions(&text, 6);
-    if actions.is_empty() {{
-        actions = extract_status_links(&page, 6);
-    }}
-    let rendered = render_story_page_highlights(&title, &summary, &actions, &url);
+    let title = first_item_title(&text).unwrap_or_else(|| format!("{SOURCE_NAME} source item"));
+    let summary = first_long_paragraph(&text, &title).unwrap_or_else(|| "No summary was found in the public source page.".into());
+    let mut links = extract_action_lines(&text, 6);
+    if links.is_empty() {
+        links = extract_source_links(&page, 6);
+    }
+    let rendered = render_page_highlights(&title, &summary, &links, &url);
 
-    Ok(serde_json::json!({{
+    Ok(serde_json::json!({
         "ok": true,
-        "functionId": "digg::story_highlights",
-        "mode": "digg_story_page",
+        "functionId": function_id,
+        "mode": "source_page",
         "title": title,
         "summary": summary,
-        "actions": actions,
+        "links": links,
         "text": rendered,
         "source": url,
         "reusedWorkers": reused_workers
-    }}))
-}}
+    }))
+}
 
-fn digg_author_rank(payload: Value, reused_workers: Value) -> Result<Value, String> {{
-    let handle = payload_text(&payload, &["handle", "xHandle", "username"])
+fn source_lookup(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
+    let query = payload_text(&payload, &["query", "handle", "xHandle", "username", "name"])
         .unwrap_or_default()
         .trim_start_matches('@')
         .to_string();
-    let url = if handle.is_empty() {{
-        "https://di.gg/ai/1000".to_string()
-    }} else {{
-        format!("https://di.gg/u/x/{{}}", handle)
-    }};
+    let url = source_url(&payload);
     let page = fetch_text(&url)?;
     let text = readable_text(&page);
-    let rank = find_rank_line(&text);
-    Ok(serde_json::json!({{
+    let matched = find_matching_line(&text, &query);
+    Ok(serde_json::json!({
         "ok": true,
-        "functionId": "digg::author_rank",
-        "handle": handle,
-        "rankLine": rank,
+        "functionId": function_id,
+        "query": query,
+        "match": matched,
         "source": url,
         "reusedWorkers": reused_workers
-    }}))
-}}
+    }))
+}
 
-fn digg_pipeline_status(payload: Value, reused_workers: Value) -> Result<Value, String> {{
-    let page = fetch_text(DIGG_AI_URL)?;
+fn source_status(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
+    let page = fetch_text(SOURCE_URL)?;
     let text = readable_text(&page);
     let status = text
         .lines()
-        .find(|line| line.contains("Posts:") || line.contains("Next crawl:") || line.contains("Fresh stories"))
-        .unwrap_or("Digg AI page reachable.")
+        .find(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("status")
+                || lower.contains("posts:")
+                || lower.contains("updated")
+                || lower.contains("fresh")
+                || lower.contains("next")
+        })
+        .unwrap_or("Source page reachable.")
         .trim()
         .to_string();
-    Ok(serde_json::json!({{
+    Ok(serde_json::json!({
         "ok": true,
-        "functionId": "digg::pipeline_status",
+        "functionId": function_id,
         "status": status,
         "payload": payload,
-        "source": DIGG_AI_URL,
+        "source": SOURCE_URL,
         "reusedWorkers": reused_workers
-    }}))
-}}
+    }))
+}
 
-fn fetch_text(url: &str) -> Result<String, String> {{
+fn fetch_text(url: &str) -> Result<String, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(12))
         .build();
     agent
         .get(url)
-        .set("User-Agent", "artifact-cli-digg-worker/0.1")
+        .set("User-Agent", "artifact-cli-generated-worker/0.1")
         .call()
         .map_err(|error| error.to_string())?
         .into_string()
         .map_err(|error| error.to_string())
-}}
+}
 
-fn story_url(payload: &Value) -> String {{
-    if let Some(url) = payload_text(payload, &["url", "storyUrl", "postUrl"]) {{
-        if url.starts_with("http://") || url.starts_with("https://") {{
+fn source_url(payload: &Value) -> String {
+    if let Some(url) = payload_text(payload, &["url", "storyUrl", "postUrl"]) {
+        if url.starts_with("http://") || url.starts_with("https://") {
             return url;
-        }}
-    }}
-    if let Some(cluster) = payload_text(payload, &["clusterUrlId", "clusterId", "id"]) {{
-        let clean = cluster.trim().trim_start_matches('/').trim_start_matches("ai/");
-        return format!("{{}}/{{}}", DIGG_AI_URL, clean);
-    }}
-    DIGG_AI_URL.to_string()
-}}
+        }
+    }
+    if let Some(id) = payload_text(payload, &["clusterUrlId", "clusterId", "id"]) {
+        let clean = id.trim().trim_start_matches('/').trim_start_matches("ai/");
+        return format!("{}/{}", SOURCE_URL.trim_end_matches('/'), clean);
+    }
+    SOURCE_URL.to_string()
+}
 
-fn has_thread_payload(payload: &Value) -> bool {{
+fn has_thread_payload(payload: &Value) -> bool {
     payload.get("prompt").is_some()
         || payload.get("reaction").is_some()
         || payload.get("replies").and_then(Value::as_array).is_some()
-}}
+}
 
-fn format_digg_thread_highlights(payload: &Value) -> String {{
-    let subject = payload_text(payload, &["subject", "title"]).unwrap_or_else(|| "Digg AI".into());
+fn format_thread_highlights(payload: &Value) -> String {
+    let subject = payload_text(payload, &["subject", "title"]).unwrap_or_else(|| SOURCE_NAME.into());
     let thread_id = payload_text(payload, &["threadId", "clusterUrlId", "id"]).unwrap_or_else(|| "thread".into());
-    let mut out = format!("{{}} thread highlights ({{}}):\n\n", subject, thread_id);
+    let mut out = format!("{} thread highlights ({}):\n\n", subject, thread_id);
 
-    if let Some(prompt) = payload.get("prompt") {{
+    if let Some(prompt) = payload.get("prompt") {
         out.push_str(&format_named_quote("The prompt", prompt));
         out.push('\n');
-    }}
-    if let Some(reaction) = payload.get("reaction") {{
+    }
+    if let Some(reaction) = payload.get("reaction") {
         out.push_str(&format_named_quote("Reaction", reaction));
         out.push('\n');
-    }}
-    if let Some(replies) = payload.get("replies").and_then(Value::as_array) {{
-        if !replies.is_empty() {{
+    }
+    if let Some(replies) = payload.get("replies").and_then(Value::as_array) {
+        if !replies.is_empty() {
             out.push_str("Notable replies:\n\n");
-            for reply in replies {{
+            for reply in replies {
                 out.push_str(&format_reply(reply));
-            }}
-        }}
-    }}
-    if let Some(takeaway) = payload_text(payload, &["takeaway", "summary"]) {{
+            }
+        }
+    }
+    if let Some(takeaway) = payload_text(payload, &["takeaway", "summary"]) {
         out.push('\n');
         out.push_str(&takeaway);
-    }}
+    }
     out.trim().to_string()
-}}
+}
 
-fn format_named_quote(label: &str, value: &Value) -> String {{
+fn format_named_quote(label: &str, value: &Value) -> String {
     let handle = value.get("handle").and_then(Value::as_str).unwrap_or("unknown");
-    let rank = value.get("rank").and_then(Value::as_i64).map(|rank| format!(", rank {{rank}}")).unwrap_or_default();
+    let rank = value.get("rank").and_then(Value::as_i64).map(|rank| format!(", rank {rank}")).unwrap_or_default();
     let text = value.get("text").and_then(Value::as_str).unwrap_or_default();
-    format!("{{label}} (@{{handle}}{{rank}}):\n\n| \"{{}}\"\n", text.trim())
-}}
+    format!("{label} (@{handle}{rank}):\n\n| \"{}\"\n", text.trim())
+}
 
-fn format_reply(reply: &Value) -> String {{
+fn format_reply(reply: &Value) -> String {
     let handle = reply.get("handle").and_then(Value::as_str).unwrap_or("unknown");
-    let role = reply.get("role").and_then(Value::as_str).unwrap_or("AI 1000");
-    let rank = reply.get("rank").and_then(Value::as_i64).map(|rank| format!(", rank {{rank}}")).unwrap_or_default();
-    let mut out = format!("- @{{handle}} ({{role}}{{rank}})");
-    if let Some(text) = reply.get("text").and_then(Value::as_str) {{
-        out.push_str(&format!(": \"{{}}\"\n", text.trim()));
-    }} else {{
+    let role = reply.get("role").and_then(Value::as_str).unwrap_or("source");
+    let rank = reply.get("rank").and_then(Value::as_i64).map(|rank| format!(", rank {rank}")).unwrap_or_default();
+    let mut out = format!("- @{handle} ({role}{rank})");
+    if let Some(text) = reply.get("text").and_then(Value::as_str) {
+        out.push_str(&format!(": \"{}\"\n", text.trim()));
+    } else {
         out.push_str(":\n");
-    }}
-    if let Some(points) = reply.get("points").and_then(Value::as_array) {{
-        for point in points {{
-            if let Some(point) = point.as_str() {{
-                out.push_str(&format!("  - {{}}\n", point.trim()));
-            }}
-        }}
-    }}
+    }
+    if let Some(points) = reply.get("points").and_then(Value::as_array) {
+        for point in points {
+            if let Some(point) = point.as_str() {
+                out.push_str(&format!("  - {}\n", point.trim()));
+            }
+        }
+    }
     out
-}}
+}
 
-fn render_story_page_highlights(title: &str, summary: &str, actions: &[Value], source: &str) -> String {{
-    let mut out = format!("{{title}} highlights:\n\nSummary:\n\n| {{summary}}\n\n");
-    if !actions.is_empty() {{
-        out.push_str("AI 1000 actions:\n\n");
-        for action in actions {{
-            let kind = action["kind"].as_str().unwrap_or("ACTION");
-            let handle = action["handle"].as_str().unwrap_or("unknown");
-            let rank = action["rank"].as_str().unwrap_or("?");
-            let text = action["text"].as_str().unwrap_or_default();
-            out.push_str(&format!("- {{kind}} @{{handle}} (rank {{rank}}): {{text}}"));
-            if let Some(url) = action.get("url").and_then(Value::as_str) {{
-                if !url.is_empty() {{
-                    out.push_str(&format!(" ({{url}})"));
-                }}
-            }}
+fn render_page_highlights(title: &str, summary: &str, links: &[Value], source: &str) -> String {
+    let mut out = format!("{title} highlights:\n\nSummary:\n\n| {summary}\n\n");
+    if !links.is_empty() {
+        out.push_str("Source links:\n\n");
+        for link in links {
+            let kind = link["kind"].as_str().unwrap_or("LINK");
+            let handle = link["handle"].as_str().unwrap_or("source");
+            let text = link["text"].as_str().unwrap_or_default();
+            out.push_str(&format!("- {kind} @{handle}: {text}"));
+            if let Some(url) = link.get("url").and_then(Value::as_str) {
+                if !url.is_empty() {
+                    out.push_str(&format!(" ({url})"));
+                }
+            }
             out.push('\n');
-        }}
+        }
         out.push('\n');
-    }}
-    out.push_str(&format!("Source: {{source}}"));
+    }
+    out.push_str(&format!("Source: {source}"));
     out
-}}
+}
 
-fn readable_text(html: &str) -> String {{
+fn readable_text(html: &str) -> String {
     let mut lines = flight_text_values(html);
-    for line in clean_lines(&html_to_text(html)) {{
-        if useful_page_value(&line) {{
+    for line in clean_lines(&html_to_text(html)) {
+        if useful_page_value(&line) {
             dedup_push(&mut lines, line);
-        }}
-    }}
+        }
+    }
     lines.join("\n")
-}}
+}
 
-fn flight_text_values(html: &str) -> Vec<String> {{
+fn flight_text_values(html: &str) -> Vec<String> {
     let decoded = decode_entities(html);
     let mut values = Vec::new();
-    for marker in ["\\\\\\\"children\\\\\\\":\\\\\\\"", "\\\"children\\\":\\\"", "\"children\":\""] {{
+    for marker in ["\\\\\\\"children\\\\\\\":\\\\\\\"", "\\\"children\\\":\\\"", "\"children\":\""] {
         let mut rest = decoded.as_str();
-        while let Some(index) = rest.find(marker) {{
+        while let Some(index) = rest.find(marker) {
             rest = &rest[index + marker.len()..];
-            if let Some((value, next)) = marker_value(rest) {{
-                if useful_page_value(&value) {{
+            if let Some((value, next)) = marker_value(rest) {
+                if useful_page_value(&value) {
                     dedup_push(&mut values, value);
-                }}
+                }
                 rest = next;
-            }} else {{
+            } else {
                 break;
-            }}
-        }}
-    }}
+            }
+        }
+    }
     values
-}}
+}
 
-fn marker_value(rest: &str) -> Option<(String, &str)> {{
+fn marker_value(rest: &str) -> Option<(String, &str)> {
     let escaped_end = rest.find("\\\\\\\"");
     let quoted_end = rest.find('"');
-    let end = match (escaped_end, quoted_end) {{
+    let end = match (escaped_end, quoted_end) {
         (Some(left), Some(right)) => left.min(right),
         (Some(left), None) => left,
         (None, Some(right)) => right,
         (None, None) => return None,
-    }};
+    };
     let raw = &rest[..end];
     let value = compact_value(&decode_js_value(raw));
     let next = &rest[end.saturating_add(1)..];
     Some((value, next))
-}}
+}
 
-fn decode_js_value(value: &str) -> String {{
+fn decode_js_value(value: &str) -> String {
     value
         .replace("\\\\n", " ")
         .replace("\\\\r", " ")
         .replace("\\\\t", " ")
         .replace("\\\\\\\"", "\"")
         .replace("\\\\\\\\", "\\")
-}}
+}
 
-fn useful_page_value(value: &str) -> bool {{
+fn useful_page_value(value: &str) -> bool {
     let value = value.trim();
     let lower = value.to_lowercase();
     let code_punctuation = value
         .chars()
-        .filter(|ch| matches!(ch, '{{' | '}}' | '=' | ';'))
+        .filter(|ch| matches!(ch, '{' | '}' | '=' | ';'))
         .count();
     value.len() >= 3
         && value.len() <= 320
@@ -1734,216 +1798,238 @@ fn useful_page_value(value: &str) -> bool {{
         && !value.contains("=>")
         && !lower.contains("return ")
         && !lower.contains("use client")
-        && !value.contains("}},{{")
+        && !value.contains("},{")
         && !lower.starts_with("var ")
         && !lower.starts_with("let ")
         && !lower.starts_with("const ")
         && !lower.starts_with("window.")
-        && !lower.starts_with("digg ai")
+        && !lower.starts_with(SOURCE_NAME)
+        && !lower.contains("terms of service")
+        && !lower.contains("privacy policy")
+        && !lower.contains("cookie policy")
+        && !lower.contains(" · ")
         && !["ai", "post", "reply", "quote", "share", "copy", "open", "close", "menu", "loading"]
             .contains(&lower.as_str())
-}}
+}
 
-fn compact_value(value: &str) -> String {{
+fn compact_value(value: &str) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    compact.trim_matches('\\').trim().to_string()
-}}
+    compact
+        .split(" · ")
+        .next()
+        .unwrap_or(&compact)
+        .trim_matches('\\')
+        .trim()
+        .to_string()
+}
 
-fn dedup_push(values: &mut Vec<String>, value: String) {{
+fn dedup_push(values: &mut Vec<String>, value: String) {
     let value = value.trim().to_string();
-    if value.is_empty() {{
+    if value.is_empty() {
         return;
-    }}
-    if !values.iter().any(|existing| existing.eq_ignore_ascii_case(&value)) {{
+    }
+    if !values.iter().any(|existing| existing.eq_ignore_ascii_case(&value)) {
         values.push(value);
-    }}
-}}
+    }
+}
 
-fn extract_story_summaries(text: &str, limit: usize) -> Vec<Value> {{
+fn extract_items(text: &str, limit: usize) -> Vec<Value> {
     let lines = clean_lines(text);
-    let mut stories = Vec::new();
-    for index in 0..lines.len() {{
+    let mut items = Vec::new();
+    for index in 0..lines.len() {
         let line = &lines[index];
-        if !looks_like_story_title(line) {{
+        if !looks_like_title(line) {
             continue;
-        }}
+        }
         let summary = lines
             .iter()
             .skip(index + 1)
             .find(|candidate| candidate.len() > 70 && !looks_like_metric_line(candidate))
             .cloned()
             .unwrap_or_default();
-        stories.push(serde_json::json!({{
-            "rank": stories.len() + 1,
+        items.push(serde_json::json!({
+            "rank": items.len() + 1,
             "title": line,
             "summary": summary
-        }}));
-        if stories.len() >= limit {{
+        }));
+        if items.len() >= limit {
             break;
-        }}
-    }}
-    stories
-}}
+        }
+    }
+    items
+}
 
-fn extract_ai1000_actions(text: &str, limit: usize) -> Vec<Value> {{
+fn extract_action_lines(text: &str, limit: usize) -> Vec<Value> {
     clean_lines(text)
         .into_iter()
         .filter_map(|line| parse_action_line(&line))
         .take(limit)
         .collect()
-}}
+}
 
-fn extract_status_links(html: &str, limit: usize) -> Vec<Value> {{
+fn extract_source_links(html: &str, limit: usize) -> Vec<Value> {
     let decoded = decode_entities(html);
-    let mut actions = Vec::new();
+    let mut links = Vec::new();
     let mut rest = decoded.as_str();
-    while let Some(index) = rest.find("https://x.com/") {{
+    while let Some(index) = rest.find("https://") {
         rest = &rest[index..];
-        let Some((url, next)) = read_url(rest) else {{
+        let Some((url, next)) = read_url(rest) else {
             break;
-        }};
+        };
         rest = next;
-        if let Some(handle) = handle_from_x_url(&url) {{
-            if actions.iter().any(|action: &Value| action["url"].as_str() == Some(url.as_str())) {{
+        if let Some(handle) = handle_from_url(&url) {
+            if links.iter().any(|link: &Value| link["url"].as_str() == Some(url.as_str())) {
                 continue;
-            }}
-            actions.push(serde_json::json!({{
-                "kind": "POST",
+            }
+            links.push(serde_json::json!({
+                "kind": "LINK",
                 "handle": handle,
-                "rank": "?",
-                "text": "source post",
+                "text": "source link",
                 "url": url
-            }}));
-            if actions.len() >= limit {{
+            }));
+            if links.len() >= limit {
                 break;
-            }}
-        }}
-    }}
-    actions
-}}
+            }
+        }
+    }
+    links
+}
 
-fn read_url(value: &str) -> Option<(String, &str)> {{
+fn read_url(value: &str) -> Option<(String, &str)> {
     let end = value
         .char_indices()
         .find(|(_, ch)| ch.is_whitespace() || *ch == '"' || *ch == '\'' || *ch == '<' || *ch == '\\')
         .map(|(index, _)| index)
         .unwrap_or(value.len());
-    if end == 0 {{
+    if end == 0 {
         return None;
-    }}
+    }
     Some((value[..end].trim_end_matches('/').to_string(), &value[end..]))
-}}
+}
 
-fn handle_from_x_url(url: &str) -> Option<String> {{
-    let rest = url.strip_prefix("https://x.com/")?;
-    if !rest.contains("/status/") {{
+fn handle_from_url(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://x.com/")
+        .or_else(|| url.strip_prefix("https://twitter.com/"))
+        .or_else(|| url.strip_prefix("https://github.com/"))?;
+    if rest.contains("intent/") || rest.contains("share") {
         return None;
-    }}
+    }
     let handle = rest.split('/').next()?.trim();
-    if handle.is_empty() || handle == "i" {{
+    if handle.is_empty() || handle == "i" {
         None
-    }} else {{
+    } else {
         Some(handle.to_string())
-    }}
-}}
+    }
+}
 
-fn parse_action_line(line: &str) -> Option<Value> {{
+fn parse_action_line(line: &str) -> Option<Value> {
     let mut parts = line.splitn(2, '@');
     let prefix = parts.next()?.trim();
     let rest = parts.next()?.trim();
-    if !(prefix.contains("POST") || prefix.contains("REPLY") || prefix.contains("QUOTE")) {{
+    if !(prefix.contains("POST") || prefix.contains("REPLY") || prefix.contains("QUOTE")) {
         return None;
-    }}
+    }
     let handle = rest.split_whitespace().next().unwrap_or("unknown").trim_matches(':');
     let rank = prefix
         .split('#')
         .nth(1)
-        .and_then(|value| value.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().into())
-        .filter(|value: &String| !value.is_empty())
+        .map(|value| value.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+        .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "?".into());
     let text = rest
         .split_once(handle)
         .map(|(_, value)| value.trim())
         .unwrap_or_default()
         .to_string();
-    Some(serde_json::json!({{
+    Some(serde_json::json!({
         "kind": prefix.split_whitespace().next().unwrap_or("ACTION"),
         "handle": handle.trim_start_matches('@'),
         "rank": rank,
         "text": text
-    }}))
-}}
+    }))
+}
 
-fn first_story_title(text: &str) -> Option<String> {{
+fn first_item_title(text: &str) -> Option<String> {
     clean_lines(text)
         .into_iter()
-        .find(|line| looks_like_story_title(line))
-}}
+        .find(|line| looks_like_title(line))
+}
 
-fn first_long_paragraph(text: &str, title: &str) -> Option<String> {{
+fn first_long_paragraph(text: &str, title: &str) -> Option<String> {
     clean_lines(text)
         .into_iter()
         .filter(|line| line != title)
         .find(|line| line.len() > 90 && !looks_like_metric_line(line))
-}}
+}
 
-fn find_rank_line(text: &str) -> Option<String> {{
-    clean_lines(text)
-        .into_iter()
-        .find(|line| line.contains("AI 1000") || line.starts_with('#') || line.contains("Outside top 1000"))
-}}
+fn find_matching_line(text: &str, query: &str) -> Option<String> {
+    let query = query.to_lowercase();
+    clean_lines(text).into_iter().find(|line| {
+        query.is_empty()
+            || line.to_lowercase().contains(&query)
+            || line.starts_with('#')
+            || line.to_lowercase().contains("rank")
+    })
+}
 
-fn clean_lines(text: &str) -> Vec<String> {{
+fn clean_lines(text: &str) -> Vec<String> {
     text.lines()
         .map(|line| line.trim())
         .filter(|line| !line.is_empty())
         .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|line| useful_page_value(line))
         .collect()
-}}
+}
 
-fn looks_like_story_title(line: &str) -> bool {{
+fn looks_like_title(line: &str) -> bool {
+    let lower = line.to_lowercase();
     let word_count = line.split_whitespace().count();
     line.len() > 12
         && line.len() < 180
         && word_count >= 3
+        && !line.contains('%')
         && !line.contains("Posts:")
         && !line.contains("Clusters:")
         && !line.contains("followers")
-        && !line.contains("Digg AI")
+        && !line.contains("Terms")
+        && !line.contains("Privacy")
+        && !lower.contains("fresh stories")
+        && !lower.contains("clustering")
+        && !lower.contains("complete")
         && !line.eq_ignore_ascii_case("IN CASE YOU MISSED IT")
         && line.chars().any(|ch| ch.is_ascii_lowercase())
         && !line.ends_with(':')
         && !looks_like_metric_line(line)
-}}
+}
 
-fn looks_like_metric_line(line: &str) -> bool {{
+fn looks_like_metric_line(line: &str) -> bool {
     line.chars().any(|c| c.is_ascii_digit())
         && (line.contains('k') || line.contains('M') || line.contains("h "))
         && line.split_whitespace().count() <= 8
-}}
+}
 
-fn html_to_text(html: &str) -> String {{
+fn html_to_text(html: &str) -> String {
     let mut out = String::new();
     let mut in_tag = false;
-    for ch in html.chars() {{
-        match ch {{
-            '<' => {{
+    for ch in html.chars() {
+        match ch {
+            '<' => {
                 in_tag = true;
                 out.push('\n');
-            }}
-            '>' => {{
+            }
+            '>' => {
                 in_tag = false;
                 out.push('\n');
-            }}
+            }
             _ if !in_tag => out.push(ch),
-            _ => {{}}
-        }}
-    }}
+            _ => {}
+        }
+    }
     decode_entities(&out)
-}}
+}
 
-fn decode_entities(value: &str) -> String {{
+fn decode_entities(value: &str) -> String {
     value
         .replace("&quot;", "\"")
         .replace("&#x27;", "'")
@@ -1952,27 +2038,28 @@ fn decode_entities(value: &str) -> String {{
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&nbsp;", " ")
-}}
+}
 
-fn payload_text(payload: &Value, keys: &[&str]) -> Option<String> {{
+fn payload_text(payload: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .filter_map(|key| payload.get(*key).and_then(Value::as_str))
         .map(str::trim)
         .find(|value| !value.is_empty())
         .map(str::to_string)
-}}
+}
 
-fn payload_number(payload: &Value, key: &str) -> Option<i64> {{
+fn payload_number(payload: &Value, key: &str) -> Option<i64> {
     payload.get(key).and_then(Value::as_i64)
-}}
-"#,
-        worker_name = plan.worker_name,
-        registrations = registrations
-    )
+}
+"#
+    .replace("__WORKER_NAME__", &plan.worker_name)
+    .replace("__REGISTRATIONS__", &registrations)
+    .replace("__SOURCE_URL__", &source_url)
+    .replace("__SOURCE_NAME__", &source_name)
 }
 
 fn render_worker_cargo(plan: &WorkerPlan) -> String {
-    let digg_deps = if plan.namespace == "digg" {
+    let http_deps = if uses_live_http_template(plan) {
         r#"ureq = { version = "2.12", default-features = false, features = ["tls"] }
 "#
     } else {
@@ -1991,10 +2078,10 @@ iii-sdk = "0.11.6"
 schemars = "0.8"
 serde = {{ version = "1.0", features = ["derive"] }}
 serde_json = "1.0"
-{digg_deps}
+{http_deps}
 "#,
         plan.worker_name,
-        digg_deps = digg_deps
+        http_deps = http_deps
     )
 }
 

@@ -99,7 +99,7 @@ fn infers_narrow_digg_worker_from_artifact_source() {
         .functions
         .iter()
         .any(|function| function.function_id == "digg::author_rank"
-            && function.purpose.contains("AI 1000")));
+            && function.purpose.contains("Look up a person")));
     assert!(plan
         .functions
         .iter()
@@ -315,7 +315,7 @@ fn generates_and_verifies_rust_worker_scaffold_using_iii_sdk_apis() {
 }
 
 #[test]
-fn generated_digg_worker_has_live_highlight_handlers() {
+fn generated_digg_worker_uses_generic_live_source_template() {
     let tmp = tempfile::tempdir().unwrap();
     let input = ArtifactInput {
         name: "digg".into(),
@@ -328,12 +328,47 @@ fn generated_digg_worker_has_live_highlight_handlers() {
 
     let generated = generate_worker(input).unwrap();
     let worker_source = std::fs::read_to_string(&generated.worker_path).unwrap();
-    assert!(worker_source.contains("format_digg_thread_highlights"));
+    assert!(worker_source.contains("handle_source_function"));
+    assert!(worker_source.contains("format_thread_highlights"));
     assert!(worker_source.contains("readable_text"));
-    assert!(worker_source.contains("extract_status_links"));
+    assert!(worker_source.contains("extract_source_links"));
     assert!(worker_source.contains("fetch_text"));
+    assert!(worker_source.contains("SOURCE_URL"));
     assert!(worker_source.contains("std::time::Duration::from_secs(12)"));
+    assert!(!worker_source.contains("handle_digg_function"));
+    assert!(!worker_source.contains("format_digg"));
     assert!(!worker_source.contains("\"todo\": \"implement"));
+
+    let worker_cargo = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+    assert!(worker_cargo.contains("ureq"));
+
+    let verified = verify_worker(VerifyWorkerInput {
+        output_dir: tmp.path().to_path_buf(),
+    })
+    .unwrap();
+    assert!(verified.ok);
+}
+
+#[test]
+fn generated_public_url_worker_reuses_live_template_without_new_cli_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = ArtifactInput {
+        name: "producthunt".into(),
+        goal: Some("daily launch tracking and maker lookup".into()),
+        source_type: Some(SourceType::Docs),
+        source: Some("https://www.producthunt.com".into()),
+        functions: vec!["top_launches".into(), "topic_search".into()],
+        output_dir: Some(tmp.path().to_path_buf()),
+    };
+
+    let generated = generate_worker(input).unwrap();
+    let worker_source = std::fs::read_to_string(&generated.worker_path).unwrap();
+    assert!(worker_source.contains("handle_source_function"));
+    assert!(worker_source.contains("source_top_items"));
+    assert!(worker_source.contains("source_search"));
+    assert!(worker_source.contains("const SOURCE_URL: &str = \"https://www.producthunt.com\";"));
+    assert!(!worker_source.contains("\"todo\": \"implement"));
+    assert!(!worker_source.contains("handle_digg_function"));
 
     let worker_cargo = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
     assert!(worker_cargo.contains("ureq"));
