@@ -1,7 +1,8 @@
 use artifact_cli::{
-    artifact_manifest, generate_worker, inspect_artifact, install_plan, plan_worker,
-    registered_function_ids, verify_worker, worker_catalog, worker_metadata, worker_recipes,
-    ArtifactInput, RecipeStage, SourceType, VerifyWorkerInput,
+    artifact_manifest, convert_artifact, generate_worker, inspect_artifact, install_plan,
+    plan_worker, registered_function_ids, verify_worker, worker_catalog, worker_metadata,
+    worker_recipes, ArtifactInput, ConvertArtifactInput, RecipeStage, SourceType,
+    VerifyWorkerInput,
 };
 
 #[test]
@@ -279,6 +280,7 @@ fn exposes_the_same_artifact_function_ids_as_iii_primitives() {
             "artifact::recipes",
             "artifact::inspect",
             "artifact::plan_worker",
+            "artifact::convert",
             "artifact::generate_worker",
             "artifact::verify_worker",
             "artifact::manifest",
@@ -288,6 +290,54 @@ fn exposes_the_same_artifact_function_ids_as_iii_primitives() {
     let metadata = worker_metadata();
     assert_eq!(metadata.runtime, "rust");
     assert_eq!(metadata.name, "artifact-cli-worker");
+}
+
+#[test]
+fn convert_artifact_accepts_mcp_url_payload_and_generates_worker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let generated = convert_artifact(ConvertArtifactInput {
+        name: Some("github mcp".into()),
+        goal: Some("Expose selected MCP tools as stable HTTP-invokable iii functions.".into()),
+        source_type: Some(SourceType::Mcp),
+        source: Some("https://example.com/mcp".into()),
+        functions: vec!["search_repos".into(), "get_issue".into()],
+        output_dir: Some(tmp.path().to_path_buf()),
+    })
+    .unwrap();
+
+    assert!(generated.worker_path.ends_with("src/main.rs"));
+    assert_eq!(generated.plan.namespace, "github_mcp");
+    assert_eq!(generated.plan.source_type, SourceType::Mcp);
+    assert!(generated.plan.uses_workers.contains(&"mcp".to_string()));
+    assert!(generated
+        .plan
+        .uses_workers
+        .contains(&"iii-rest".to_string()));
+
+    let manifest = std::fs::read_to_string(&generated.manifest_path).unwrap();
+    assert!(manifest.contains("\"sourceType\": \"mcp\""));
+    assert!(manifest.contains("\"github_mcp::search_repos\""));
+    assert!(manifest.contains("\"github_mcp::get_issue\""));
+}
+
+#[test]
+fn convert_artifact_infers_name_from_url_payload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let generated = convert_artifact(ConvertArtifactInput {
+        source: Some("https://github.com/HackerNews/API".into()),
+        goal: Some("top stories and item lookup".into()),
+        output_dir: Some(tmp.path().to_path_buf()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    assert_eq!(generated.plan.namespace, "hackernews");
+    assert_eq!(generated.plan.source_type, SourceType::Url);
+    assert!(generated
+        .plan
+        .functions
+        .iter()
+        .any(|function| function.function_id == "hackernews::top_stories"));
 }
 
 #[test]
