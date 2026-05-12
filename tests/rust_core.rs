@@ -313,3 +313,34 @@ fn generates_and_verifies_rust_worker_scaffold_using_iii_sdk_apis() {
         .iter()
         .any(|command| command.contains("cargo build --release")));
 }
+
+#[test]
+fn generated_digg_worker_has_live_highlight_handlers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = ArtifactInput {
+        name: "digg".into(),
+        goal: Some("focused Digg AI story highlights".into()),
+        source_type: Some(SourceType::Docs),
+        source: Some("https://di.gg/ai".into()),
+        functions: vec!["story_highlights".into(), "top_stories".into()],
+        output_dir: Some(tmp.path().to_path_buf()),
+    };
+
+    let generated = generate_worker(input).unwrap();
+    let worker_source = std::fs::read_to_string(&generated.worker_path).unwrap();
+    assert!(worker_source.contains("format_digg_thread_highlights"));
+    assert!(worker_source.contains("readable_text"));
+    assert!(worker_source.contains("extract_status_links"));
+    assert!(worker_source.contains("fetch_text"));
+    assert!(worker_source.contains("std::time::Duration::from_secs(12)"));
+    assert!(!worker_source.contains("\"todo\": \"implement"));
+
+    let worker_cargo = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+    assert!(worker_cargo.contains("ureq"));
+
+    let verified = verify_worker(VerifyWorkerInput {
+        output_dir: tmp.path().to_path_buf(),
+    })
+    .unwrap();
+    assert!(verified.ok);
+}

@@ -1324,6 +1324,10 @@ fn plan_digg_function(namespace: &str, function: &str) -> WorkerFunctionPlan {
 }
 
 fn render_worker_source(plan: &WorkerPlan) -> String {
+    if plan.namespace == "digg" {
+        return render_digg_worker_source(plan);
+    }
+
     let reused_workers = json_string_array(&plan.uses_workers);
     let registrations = plan
         .functions
@@ -1369,7 +1373,612 @@ fn main() {{
     )
 }
 
+fn render_digg_worker_source(plan: &WorkerPlan) -> String {
+    let reused_workers = json_string_array(&plan.uses_workers);
+    let registrations = plan
+        .functions
+        .iter()
+        .map(|function| {
+            format!(
+                r#"    iii.register_function(RegisterFunction::new("{function_id}", |payload: serde_json::Value| -> Result<serde_json::Value, String> {{
+        handle_digg_function("{function_id}", payload, serde_json::json!({reused_workers}))
+    }}).description("{purpose}"));
+"#,
+                function_id = function.function_id,
+                purpose = function.purpose,
+                reused_workers = reused_workers
+            )
+        })
+        .collect::<String>();
+
+    format!(
+        r#"use iii_sdk::{{register_worker, InitOptions, RegisterFunction, RegisterServiceMessage}};
+use serde_json::Value;
+
+const DIGG_AI_URL: &str = "https://di.gg/ai";
+
+fn main() {{
+    let engine_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
+    let iii = register_worker(&engine_url, InitOptions::default());
+    iii.register_service(RegisterServiceMessage {{
+        id: "{worker_name}".into(),
+        name: "{worker_name}".into(),
+        description: Some("Generated artifact-cli Rust iii worker".into()),
+        parent_service_id: None,
+    }});
+{registrations}    println!("{worker_name} registered functions against {{engine_url}}");
+    std::thread::park();
+    iii.shutdown();
+}}
+
+fn handle_digg_function(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {{
+    match function_id {{
+        "digg::top_stories" => digg_top_stories(payload, reused_workers),
+        "digg::story_highlights" => digg_story_highlights(payload, reused_workers),
+        "digg::search_stories" => digg_search_stories(payload, reused_workers),
+        "digg::author_rank" => digg_author_rank(payload, reused_workers),
+        "digg::pipeline_status" => digg_pipeline_status(payload, reused_workers),
+        _ => Ok(serde_json::json!({{
+            "ok": true,
+            "functionId": function_id,
+            "payload": payload,
+            "reusedWorkers": reused_workers
+        }})),
+    }}
+}}
+
+fn digg_top_stories(payload: Value, reused_workers: Value) -> Result<Value, String> {{
+    let limit = payload_number(&payload, "limit").unwrap_or(10).clamp(1, 30) as usize;
+    let page = fetch_text(DIGG_AI_URL)?;
+    let text = readable_text(&page);
+    let stories = extract_story_summaries(&text, limit);
+    Ok(serde_json::json!({{
+        "ok": true,
+        "functionId": "digg::top_stories",
+        "source": DIGG_AI_URL,
+        "stories": stories,
+        "reusedWorkers": reused_workers
+    }}))
+}}
+
+fn digg_search_stories(payload: Value, reused_workers: Value) -> Result<Value, String> {{
+    let query = payload_text(&payload, &["query", "q", "topic"]).unwrap_or_default().to_lowercase();
+    let page = fetch_text(DIGG_AI_URL)?;
+    let text = readable_text(&page);
+    let mut matches = extract_story_summaries(&text, 30)
+        .into_iter()
+        .filter(|story| {{
+            if query.is_empty() {{
+                true
+            }} else {{
+                story["title"].as_str().unwrap_or_default().to_lowercase().contains(&query)
+                    || story["summary"].as_str().unwrap_or_default().to_lowercase().contains(&query)
+            }}
+        }})
+        .collect::<Vec<_>>();
+    let limit = payload_number(&payload, "limit").unwrap_or(10).clamp(1, 30) as usize;
+    matches.truncate(limit);
+    Ok(serde_json::json!({{
+        "ok": true,
+        "functionId": "digg::search_stories",
+        "query": query,
+        "matches": matches,
+        "source": DIGG_AI_URL,
+        "reusedWorkers": reused_workers
+    }}))
+}}
+
+fn digg_story_highlights(payload: Value, reused_workers: Value) -> Result<Value, String> {{
+    if has_thread_payload(&payload) {{
+        let text = format_digg_thread_highlights(&payload);
+        return Ok(serde_json::json!({{
+            "ok": true,
+            "functionId": "digg::story_highlights",
+            "mode": "thread_payload",
+            "text": text,
+            "reusedWorkers": reused_workers
+        }}));
+    }}
+
+    let url = story_url(&payload);
+    let page = fetch_text(&url)?;
+    let text = readable_text(&page);
+    let title = first_story_title(&text).unwrap_or_else(|| "Digg AI story".into());
+    let summary = first_long_paragraph(&text, &title).unwrap_or_else(|| "No summary was found in the public story page.".into());
+    let mut actions = extract_ai1000_actions(&text, 6);
+    if actions.is_empty() {{
+        actions = extract_status_links(&page, 6);
+    }}
+    let rendered = render_story_page_highlights(&title, &summary, &actions, &url);
+
+    Ok(serde_json::json!({{
+        "ok": true,
+        "functionId": "digg::story_highlights",
+        "mode": "digg_story_page",
+        "title": title,
+        "summary": summary,
+        "actions": actions,
+        "text": rendered,
+        "source": url,
+        "reusedWorkers": reused_workers
+    }}))
+}}
+
+fn digg_author_rank(payload: Value, reused_workers: Value) -> Result<Value, String> {{
+    let handle = payload_text(&payload, &["handle", "xHandle", "username"])
+        .unwrap_or_default()
+        .trim_start_matches('@')
+        .to_string();
+    let url = if handle.is_empty() {{
+        "https://di.gg/ai/1000".to_string()
+    }} else {{
+        format!("https://di.gg/u/x/{{}}", handle)
+    }};
+    let page = fetch_text(&url)?;
+    let text = readable_text(&page);
+    let rank = find_rank_line(&text);
+    Ok(serde_json::json!({{
+        "ok": true,
+        "functionId": "digg::author_rank",
+        "handle": handle,
+        "rankLine": rank,
+        "source": url,
+        "reusedWorkers": reused_workers
+    }}))
+}}
+
+fn digg_pipeline_status(payload: Value, reused_workers: Value) -> Result<Value, String> {{
+    let page = fetch_text(DIGG_AI_URL)?;
+    let text = readable_text(&page);
+    let status = text
+        .lines()
+        .find(|line| line.contains("Posts:") || line.contains("Next crawl:") || line.contains("Fresh stories"))
+        .unwrap_or("Digg AI page reachable.")
+        .trim()
+        .to_string();
+    Ok(serde_json::json!({{
+        "ok": true,
+        "functionId": "digg::pipeline_status",
+        "status": status,
+        "payload": payload,
+        "source": DIGG_AI_URL,
+        "reusedWorkers": reused_workers
+    }}))
+}}
+
+fn fetch_text(url: &str) -> Result<String, String> {{
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(12))
+        .build();
+    agent
+        .get(url)
+        .set("User-Agent", "artifact-cli-digg-worker/0.1")
+        .call()
+        .map_err(|error| error.to_string())?
+        .into_string()
+        .map_err(|error| error.to_string())
+}}
+
+fn story_url(payload: &Value) -> String {{
+    if let Some(url) = payload_text(payload, &["url", "storyUrl", "postUrl"]) {{
+        if url.starts_with("http://") || url.starts_with("https://") {{
+            return url;
+        }}
+    }}
+    if let Some(cluster) = payload_text(payload, &["clusterUrlId", "clusterId", "id"]) {{
+        let clean = cluster.trim().trim_start_matches('/').trim_start_matches("ai/");
+        return format!("{{}}/{{}}", DIGG_AI_URL, clean);
+    }}
+    DIGG_AI_URL.to_string()
+}}
+
+fn has_thread_payload(payload: &Value) -> bool {{
+    payload.get("prompt").is_some()
+        || payload.get("reaction").is_some()
+        || payload.get("replies").and_then(Value::as_array).is_some()
+}}
+
+fn format_digg_thread_highlights(payload: &Value) -> String {{
+    let subject = payload_text(payload, &["subject", "title"]).unwrap_or_else(|| "Digg AI".into());
+    let thread_id = payload_text(payload, &["threadId", "clusterUrlId", "id"]).unwrap_or_else(|| "thread".into());
+    let mut out = format!("{{}} thread highlights ({{}}):\n\n", subject, thread_id);
+
+    if let Some(prompt) = payload.get("prompt") {{
+        out.push_str(&format_named_quote("The prompt", prompt));
+        out.push('\n');
+    }}
+    if let Some(reaction) = payload.get("reaction") {{
+        out.push_str(&format_named_quote("Reaction", reaction));
+        out.push('\n');
+    }}
+    if let Some(replies) = payload.get("replies").and_then(Value::as_array) {{
+        if !replies.is_empty() {{
+            out.push_str("Notable replies:\n\n");
+            for reply in replies {{
+                out.push_str(&format_reply(reply));
+            }}
+        }}
+    }}
+    if let Some(takeaway) = payload_text(payload, &["takeaway", "summary"]) {{
+        out.push('\n');
+        out.push_str(&takeaway);
+    }}
+    out.trim().to_string()
+}}
+
+fn format_named_quote(label: &str, value: &Value) -> String {{
+    let handle = value.get("handle").and_then(Value::as_str).unwrap_or("unknown");
+    let rank = value.get("rank").and_then(Value::as_i64).map(|rank| format!(", rank {{rank}}")).unwrap_or_default();
+    let text = value.get("text").and_then(Value::as_str).unwrap_or_default();
+    format!("{{label}} (@{{handle}}{{rank}}):\n\n| \"{{}}\"\n", text.trim())
+}}
+
+fn format_reply(reply: &Value) -> String {{
+    let handle = reply.get("handle").and_then(Value::as_str).unwrap_or("unknown");
+    let role = reply.get("role").and_then(Value::as_str).unwrap_or("AI 1000");
+    let rank = reply.get("rank").and_then(Value::as_i64).map(|rank| format!(", rank {{rank}}")).unwrap_or_default();
+    let mut out = format!("- @{{handle}} ({{role}}{{rank}})");
+    if let Some(text) = reply.get("text").and_then(Value::as_str) {{
+        out.push_str(&format!(": \"{{}}\"\n", text.trim()));
+    }} else {{
+        out.push_str(":\n");
+    }}
+    if let Some(points) = reply.get("points").and_then(Value::as_array) {{
+        for point in points {{
+            if let Some(point) = point.as_str() {{
+                out.push_str(&format!("  - {{}}\n", point.trim()));
+            }}
+        }}
+    }}
+    out
+}}
+
+fn render_story_page_highlights(title: &str, summary: &str, actions: &[Value], source: &str) -> String {{
+    let mut out = format!("{{title}} highlights:\n\nSummary:\n\n| {{summary}}\n\n");
+    if !actions.is_empty() {{
+        out.push_str("AI 1000 actions:\n\n");
+        for action in actions {{
+            let kind = action["kind"].as_str().unwrap_or("ACTION");
+            let handle = action["handle"].as_str().unwrap_or("unknown");
+            let rank = action["rank"].as_str().unwrap_or("?");
+            let text = action["text"].as_str().unwrap_or_default();
+            out.push_str(&format!("- {{kind}} @{{handle}} (rank {{rank}}): {{text}}"));
+            if let Some(url) = action.get("url").and_then(Value::as_str) {{
+                if !url.is_empty() {{
+                    out.push_str(&format!(" ({{url}})"));
+                }}
+            }}
+            out.push('\n');
+        }}
+        out.push('\n');
+    }}
+    out.push_str(&format!("Source: {{source}}"));
+    out
+}}
+
+fn readable_text(html: &str) -> String {{
+    let mut lines = flight_text_values(html);
+    for line in clean_lines(&html_to_text(html)) {{
+        if useful_page_value(&line) {{
+            dedup_push(&mut lines, line);
+        }}
+    }}
+    lines.join("\n")
+}}
+
+fn flight_text_values(html: &str) -> Vec<String> {{
+    let decoded = decode_entities(html);
+    let mut values = Vec::new();
+    for marker in ["\\\\\\\"children\\\\\\\":\\\\\\\"", "\\\"children\\\":\\\"", "\"children\":\""] {{
+        let mut rest = decoded.as_str();
+        while let Some(index) = rest.find(marker) {{
+            rest = &rest[index + marker.len()..];
+            if let Some((value, next)) = marker_value(rest) {{
+                if useful_page_value(&value) {{
+                    dedup_push(&mut values, value);
+                }}
+                rest = next;
+            }} else {{
+                break;
+            }}
+        }}
+    }}
+    values
+}}
+
+fn marker_value(rest: &str) -> Option<(String, &str)> {{
+    let escaped_end = rest.find("\\\\\\\"");
+    let quoted_end = rest.find('"');
+    let end = match (escaped_end, quoted_end) {{
+        (Some(left), Some(right)) => left.min(right),
+        (Some(left), None) => left,
+        (None, Some(right)) => right,
+        (None, None) => return None,
+    }};
+    let raw = &rest[..end];
+    let value = compact_value(&decode_js_value(raw));
+    let next = &rest[end.saturating_add(1)..];
+    Some((value, next))
+}}
+
+fn decode_js_value(value: &str) -> String {{
+    value
+        .replace("\\\\n", " ")
+        .replace("\\\\r", " ")
+        .replace("\\\\t", " ")
+        .replace("\\\\\\\"", "\"")
+        .replace("\\\\\\\\", "\\")
+}}
+
+fn useful_page_value(value: &str) -> bool {{
+    let value = value.trim();
+    let lower = value.to_lowercase();
+    let code_punctuation = value
+        .chars()
+        .filter(|ch| matches!(ch, '{{' | '}}' | '=' | ';'))
+        .count();
+    value.len() >= 3
+        && value.len() <= 320
+        && code_punctuation == 0
+        && !value.contains("self.__next_f.push")
+        && !value.contains("className")
+        && !value.contains("function")
+        && !value.contains("children")
+        && !value.contains("href")
+        && !value.contains("xmlns")
+        && !value.contains("viewBox")
+        && !value.contains("lucide")
+        && !value.contains("webpack")
+        && !value.contains("__next")
+        && !value.contains("Symbol(")
+        && !value.contains("=>")
+        && !lower.contains("return ")
+        && !lower.contains("use client")
+        && !value.contains("}},{{")
+        && !lower.starts_with("var ")
+        && !lower.starts_with("let ")
+        && !lower.starts_with("const ")
+        && !lower.starts_with("window.")
+        && !lower.starts_with("digg ai")
+        && !["ai", "post", "reply", "quote", "share", "copy", "open", "close", "menu", "loading"]
+            .contains(&lower.as_str())
+}}
+
+fn compact_value(value: &str) -> String {{
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact.trim_matches('\\').trim().to_string()
+}}
+
+fn dedup_push(values: &mut Vec<String>, value: String) {{
+    let value = value.trim().to_string();
+    if value.is_empty() {{
+        return;
+    }}
+    if !values.iter().any(|existing| existing.eq_ignore_ascii_case(&value)) {{
+        values.push(value);
+    }}
+}}
+
+fn extract_story_summaries(text: &str, limit: usize) -> Vec<Value> {{
+    let lines = clean_lines(text);
+    let mut stories = Vec::new();
+    for index in 0..lines.len() {{
+        let line = &lines[index];
+        if !looks_like_story_title(line) {{
+            continue;
+        }}
+        let summary = lines
+            .iter()
+            .skip(index + 1)
+            .find(|candidate| candidate.len() > 70 && !looks_like_metric_line(candidate))
+            .cloned()
+            .unwrap_or_default();
+        stories.push(serde_json::json!({{
+            "rank": stories.len() + 1,
+            "title": line,
+            "summary": summary
+        }}));
+        if stories.len() >= limit {{
+            break;
+        }}
+    }}
+    stories
+}}
+
+fn extract_ai1000_actions(text: &str, limit: usize) -> Vec<Value> {{
+    clean_lines(text)
+        .into_iter()
+        .filter_map(|line| parse_action_line(&line))
+        .take(limit)
+        .collect()
+}}
+
+fn extract_status_links(html: &str, limit: usize) -> Vec<Value> {{
+    let decoded = decode_entities(html);
+    let mut actions = Vec::new();
+    let mut rest = decoded.as_str();
+    while let Some(index) = rest.find("https://x.com/") {{
+        rest = &rest[index..];
+        let Some((url, next)) = read_url(rest) else {{
+            break;
+        }};
+        rest = next;
+        if let Some(handle) = handle_from_x_url(&url) {{
+            if actions.iter().any(|action: &Value| action["url"].as_str() == Some(url.as_str())) {{
+                continue;
+            }}
+            actions.push(serde_json::json!({{
+                "kind": "POST",
+                "handle": handle,
+                "rank": "?",
+                "text": "source post",
+                "url": url
+            }}));
+            if actions.len() >= limit {{
+                break;
+            }}
+        }}
+    }}
+    actions
+}}
+
+fn read_url(value: &str) -> Option<(String, &str)> {{
+    let end = value
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace() || *ch == '"' || *ch == '\'' || *ch == '<' || *ch == '\\')
+        .map(|(index, _)| index)
+        .unwrap_or(value.len());
+    if end == 0 {{
+        return None;
+    }}
+    Some((value[..end].trim_end_matches('/').to_string(), &value[end..]))
+}}
+
+fn handle_from_x_url(url: &str) -> Option<String> {{
+    let rest = url.strip_prefix("https://x.com/")?;
+    if !rest.contains("/status/") {{
+        return None;
+    }}
+    let handle = rest.split('/').next()?.trim();
+    if handle.is_empty() || handle == "i" {{
+        None
+    }} else {{
+        Some(handle.to_string())
+    }}
+}}
+
+fn parse_action_line(line: &str) -> Option<Value> {{
+    let mut parts = line.splitn(2, '@');
+    let prefix = parts.next()?.trim();
+    let rest = parts.next()?.trim();
+    if !(prefix.contains("POST") || prefix.contains("REPLY") || prefix.contains("QUOTE")) {{
+        return None;
+    }}
+    let handle = rest.split_whitespace().next().unwrap_or("unknown").trim_matches(':');
+    let rank = prefix
+        .split('#')
+        .nth(1)
+        .and_then(|value| value.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().into())
+        .filter(|value: &String| !value.is_empty())
+        .unwrap_or_else(|| "?".into());
+    let text = rest
+        .split_once(handle)
+        .map(|(_, value)| value.trim())
+        .unwrap_or_default()
+        .to_string();
+    Some(serde_json::json!({{
+        "kind": prefix.split_whitespace().next().unwrap_or("ACTION"),
+        "handle": handle.trim_start_matches('@'),
+        "rank": rank,
+        "text": text
+    }}))
+}}
+
+fn first_story_title(text: &str) -> Option<String> {{
+    clean_lines(text)
+        .into_iter()
+        .find(|line| looks_like_story_title(line))
+}}
+
+fn first_long_paragraph(text: &str, title: &str) -> Option<String> {{
+    clean_lines(text)
+        .into_iter()
+        .filter(|line| line != title)
+        .find(|line| line.len() > 90 && !looks_like_metric_line(line))
+}}
+
+fn find_rank_line(text: &str) -> Option<String> {{
+    clean_lines(text)
+        .into_iter()
+        .find(|line| line.contains("AI 1000") || line.starts_with('#') || line.contains("Outside top 1000"))
+}}
+
+fn clean_lines(text: &str) -> Vec<String> {{
+    text.lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| useful_page_value(line))
+        .collect()
+}}
+
+fn looks_like_story_title(line: &str) -> bool {{
+    let word_count = line.split_whitespace().count();
+    line.len() > 12
+        && line.len() < 180
+        && word_count >= 3
+        && !line.contains("Posts:")
+        && !line.contains("Clusters:")
+        && !line.contains("followers")
+        && !line.contains("Digg AI")
+        && !line.eq_ignore_ascii_case("IN CASE YOU MISSED IT")
+        && line.chars().any(|ch| ch.is_ascii_lowercase())
+        && !line.ends_with(':')
+        && !looks_like_metric_line(line)
+}}
+
+fn looks_like_metric_line(line: &str) -> bool {{
+    line.chars().any(|c| c.is_ascii_digit())
+        && (line.contains('k') || line.contains('M') || line.contains("h "))
+        && line.split_whitespace().count() <= 8
+}}
+
+fn html_to_text(html: &str) -> String {{
+    let mut out = String::new();
+    let mut in_tag = false;
+    for ch in html.chars() {{
+        match ch {{
+            '<' => {{
+                in_tag = true;
+                out.push('\n');
+            }}
+            '>' => {{
+                in_tag = false;
+                out.push('\n');
+            }}
+            _ if !in_tag => out.push(ch),
+            _ => {{}}
+        }}
+    }}
+    decode_entities(&out)
+}}
+
+fn decode_entities(value: &str) -> String {{
+    value
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+}}
+
+fn payload_text(payload: &Value, keys: &[&str]) -> Option<String> {{
+    keys.iter()
+        .filter_map(|key| payload.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
+}}
+
+fn payload_number(payload: &Value, key: &str) -> Option<i64> {{
+    payload.get(key).and_then(Value::as_i64)
+}}
+"#,
+        worker_name = plan.worker_name,
+        registrations = registrations
+    )
+}
+
 fn render_worker_cargo(plan: &WorkerPlan) -> String {
+    let digg_deps = if plan.namespace == "digg" {
+        r#"ureq = { version = "2.12", default-features = false, features = ["tls"] }
+"#
+    } else {
+        ""
+    };
+
     format!(
         r#"[package]
 name = "{}"
@@ -1382,8 +1991,10 @@ iii-sdk = "0.11.6"
 schemars = "0.8"
 serde = {{ version = "1.0", features = ["derive"] }}
 serde_json = "1.0"
+{digg_deps}
 "#,
-        plan.worker_name
+        plan.worker_name,
+        digg_deps = digg_deps
     )
 }
 
