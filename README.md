@@ -1,32 +1,48 @@
 # artifact-cli
 
-Turn APIs, specs, docs, and workflow artifacts into narrowly scoped **Rust iii workers**.
+Turn MCP servers, APIs, specs, docs, and workflow artifacts into narrowly scoped **Rust iii workers**.
 
-`artifact-cli` is a research project for agent-operable backend surfaces: instead of giving an agent a giant API wrapper or asking it to read docs at runtime, generate a focused Rust worker with a small set of precise iii functions and a concrete reuse plan for the iii engine and `iii-hq/workers`.
+`artifact-cli` is the repo/crate name. The product surface should be the `artifact::*` iii worker. Instead of giving an agent a giant MCP tool catalog, a broad API wrapper, or docs to read at runtime, `artifact::convert` generates a focused Rust worker with a small set of precise iii functions and a concrete reuse plan for the iii engine and `iii-hq/workers`.
 
 ```text
-artifact -> narrow Rust iii worker -> callable functions
+MCP/spec/docs -> artifact::convert -> narrow Rust iii worker -> iii/HTTP-invokable functions
 ```
 
-The intended iii-native UX is:
+The intended iii-native UX is worker-first:
 
 ```bash
-iii convert https://github.com/HackerNews/API \
-  --goal "top stories and item lookup" \
-  --out generated/hackernews-worker
+cargo run --bin artifact-cli-worker -- serve --iii-url ws://localhost:49134
 
-iii convert --payload examples/producthunt.payload.json \
-  --out generated/producthunt-worker
+iii trigger --function-id artifact::convert --payload '{
+  "url": "https://github.com/HackerNews/API",
+  "goal": "top stories and item lookup",
+  "outputDir": "generated/hackernews-worker"
+}' --timeout-ms 30000
 
-iii worker run generated/producthunt-worker
-iii trigger --function-id producthunt::top_launches --payload '{"limit":3}'
+cd generated/hackernews-worker
+cargo run --quiet
+
+iii trigger --function-id hackernews::top_stories --payload '{"limit":5}'
 ```
 
-Today, the standalone `artifact` binary provides the same generation flow while `iii convert` is being wired into the iii CLI surface.
+For MCP conversion, make the source type explicit and choose the narrow functions that should become stable worker calls:
+
+```bash
+iii trigger --function-id artifact::convert --payload '{
+  "name": "github_mcp",
+  "sourceType": "mcp",
+  "url": "https://example.com/mcp",
+  "goal": "Expose selected MCP tools as narrow HTTP-invokable iii functions",
+  "functions": ["search_repos", "get_issue"],
+  "outputDir": "generated/github-mcp-worker"
+}' --timeout-ms 30000
+```
+
+The standalone `artifact` binary is a development convenience for local generation, verification, and demos. It is not the intended primary user interface.
 
 ## Why this exists
 
-Agents are better when they call stable functions instead of browsing docs, guessing endpoints, or stitching workflows from scratch. `artifact-cli` creates small iii-native Rust workers around a specific job:
+Agents are better when they call stable functions instead of browsing docs, guessing endpoints, or stitching workflows from scratch. `artifact::convert` creates small iii-native Rust workers around a specific job:
 
 - `linear_risk::blocked_issues`
 - `github_repo::stale_prs`
@@ -37,11 +53,11 @@ The point is not to generate every endpoint. The point is to generate the few fu
 
 ## Why Rust
 
-`artifact-cli` is infrastructure: parsing, planning, generation, verification, packaging, filesystem work, and eventually worker registry publishing. Rust gives us a single binary, strong manifests, safer execution boundaries, and a cleaner path to binary workers for the iii ecosystem.
+The artifact crate is infrastructure: parsing, planning, generation, verification, packaging, filesystem work, and eventually worker registry publishing. Rust gives us a single binary, strong manifests, safer execution boundaries, and a cleaner path to binary workers for the iii ecosystem.
 
 ## How it fits iii
 
-`artifact-cli` composes with prebuilt iii surfaces instead of rebuilding platform plumbing:
+Artifact composes with prebuilt iii surfaces instead of rebuilding platform plumbing:
 
 - `iii-hq/iii` builtins — state, queue, cron, REST, stream, sandbox, observability
 - `iii-hq/workers` modules — credentials, shell, filesystem, database, MCP, skills, proof, model providers, hooks, sessions, policy
@@ -55,7 +71,8 @@ The Rust worker registers the same `artifact::*` function surface through `iii-s
 - `artifact::inspect` — classify a source artifact and suggest focused worker functions
 - `artifact::catalog` — list reusable iii engine builtins and installable `iii-hq/workers`
 - `artifact::plan_worker` — produce a narrow worker plan from an artifact description
-- `artifact::generate_worker` — generate a Rust iii worker scaffold
+- `artifact::convert` — convert a URL, spec, docs page, HAR, or MCP server into a narrow Rust iii worker scaffold
+- `artifact::generate_worker` — compatibility alias for direct named worker generation
 - `artifact::verify_worker` — run structural checks on a generated worker
 - `artifact::manifest` — create a manifest preview for registry/publish workflows
 
@@ -65,7 +82,7 @@ Run it as a live iii worker:
 cargo run --bin artifact-cli-worker -- serve --iii-url ws://localhost:49134
 ```
 
-The primary CLI is the human doorway. It generates workers, verifies them, prints install commands, and can call registered iii functions:
+The worker function surface is the primary interface. The standalone binary is the local development doorway for generation, verification, install plans, and demos:
 
 ```bash
 cargo run --bin artifact -- catalog
@@ -125,31 +142,41 @@ Call a registered generated function:
 cargo run --bin artifact -- call hackernews::top_stories --json '{"limit":10}'
 ```
 
-## Planned iii-native command
+## Worker-first conversion
 
-`artifact-cli` is a worker factory, so the final public command should feel like part of iii rather than like a separate generator. The target shape is `iii convert`: convert a URL, spec, HAR, docs page, or payload into a focused iii worker.
-
-```bash
-iii convert <source-or-url> \
-  --goal "<agent job>" \
-  --out <worker-dir>
-```
-
-Payload mode should stay first-class for repeatable builds:
+Artifact is a worker factory, so the public path should feel like part of iii rather than a separate generator. The primitive is `artifact::convert`: convert a URL, spec, HAR, docs page, MCP server, or payload into a focused iii worker.
 
 ```bash
-iii convert --payload examples/digg.payload.json \
-  --out generated/digg-worker
+iii trigger --function-id artifact::convert --payload '{
+  "url": "<source-or-url>",
+  "goal": "<agent job>",
+  "outputDir": "<worker-dir>"
+}'
 ```
 
-Worker lifecycle remains native iii:
+MCP payloads should be explicit because the output is not another MCP call. The output is a worker that exposes selected MCP-backed operations as stable iii functions, which can then be bound to HTTP triggers when direct HTTP invocation is needed:
 
 ```bash
-iii worker run generated/digg-worker
-iii trigger --function-id digg::top_stories --payload '{"limit":3}'
+iii trigger --function-id artifact::convert --payload '{
+  "name": "docs_mcp",
+  "sourceType": "mcp",
+  "url": "https://example.com/mcp",
+  "goal": "Replace broad MCP tool calls with narrow worker functions",
+  "functions": ["search_docs", "read_doc"],
+  "outputDir": "generated/docs-mcp-worker"
+}'
 ```
 
-Until `iii convert` is available, use the current equivalent:
+After generation, run the produced worker and call the generated functions through iii:
+
+```bash
+cd generated/docs-mcp-worker
+cargo run --quiet
+
+iii trigger --function-id docs_mcp::search_docs --payload '{"query":"auth","limit":5}'
+```
+
+Repeatable file payloads still work through the current development binary:
 
 ```bash
 cargo run --bin artifact -- generate \
@@ -159,7 +186,7 @@ cargo run --bin artifact -- generate \
 
 ## Live generated worker demos
 
-These transcripts show the important path: Artifact CLI generates the worker, the generated Rust crate compiles, the worker registers with iii, and `iii trigger` returns live data. The exact stories and launch names will change as the public feeds change.
+These transcripts show the important path: Artifact generates the worker, the generated Rust crate compiles, the worker registers with iii, and `iii trigger` returns live data. The exact stories and launch names will change as the public feeds change.
 
 Run the engine in one terminal:
 
@@ -497,11 +524,11 @@ Each generated plan also includes:
 - `usesWorkers` — all selected iii builtins and installable workers
 - `reusePlan.engineBuiltins` — functions already provided by `iii-hq/iii`
 - `reusePlan.installableWorkers` — `iii worker add <name>` dependencies from `iii-hq/workers`
-- `reusePlan.missingCapabilities` — anything artifact-cli could not map to a reusable worker
+- `reusePlan.missingCapabilities` — anything Artifact could not map to a reusable worker
 
 ## Principles
 
-1. **Rust-first** — core, CLI, worker runtime, and generated workers should be Rust.
+1. **Rust-first** — core, development binary, worker runtime, and generated workers should be Rust.
 2. **Narrow beats generic** — generate workers around jobs, not every endpoint.
 3. **Functions over docs** — agents call `function_id` instead of reading docs at runtime.
 4. **Composable by default** — use existing iii workers for state, queues, cron, database, HTTP, sandboxing, and observability.
@@ -529,4 +556,4 @@ cargo run --bin artifact -- from https://github.com/HackerNews/API --goal "top s
 
 ## Status
 
-Production Rust worker plus primary `artifact` CLI. `artifact-cli-worker` can run as a live `iii-sdk` worker and register the full `artifact::*` function surface. Generated workers are also Rust and use `iii-sdk` registration APIs directly.
+Production Rust worker plus development `artifact` binary. `artifact-cli-worker` can run as a live `iii-sdk` worker and register the full `artifact::*` function surface, including `artifact::convert`. Generated workers are also Rust and use `iii-sdk` registration APIs directly.
