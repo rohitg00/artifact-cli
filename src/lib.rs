@@ -1459,8 +1459,8 @@ fn render_public_source_worker_source(plan: &WorkerPlan) -> String {
         .collect::<String>();
     let source_url = serde_json::to_string(plan.source.as_deref().unwrap_or_default())
         .unwrap_or_else(|_| "\"\"".into());
-    let source_name =
-        serde_json::to_string(&plan.namespace).unwrap_or_else(|_| "\"source\"".into());
+    let source_name = serde_json::to_string(&canonical_source_name(&plan.namespace))
+        .unwrap_or_else(|_| "\"source\"".into());
 
     r#"use iii_sdk::{register_worker, InitOptions, RegisterFunction, RegisterServiceMessage};
 use serde_json::Value;
@@ -1647,7 +1647,10 @@ fn handle_producthunt_function(
     payload: Value,
     reused_workers: Value,
 ) -> Result<Value, String> {
-    if function_name.contains("search") || function_name.contains("lookup") || function_name.contains("detail") {
+    if function_name.contains("lookup") || function_name.contains("detail") {
+        return producthunt_details(function_id, payload, reused_workers);
+    }
+    if function_name.contains("search") {
         return producthunt_search(function_id, payload, reused_workers);
     }
     if function_name.contains("metric") || function_name.contains("status") {
@@ -1667,6 +1670,46 @@ fn producthunt_top_launches(function_id: &str, payload: Value, reused_workers: V
         "items": launches,
         "reusedWorkers": reused_workers
     }))
+}
+
+fn producthunt_details(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
+    let feed = fetch_text("https://www.producthunt.com/feed")?;
+    let launches = producthunt_feed_items(&feed, 60);
+    let id = payload_text(&payload, &["id", "postId", "productId"]);
+    let url = payload_text(&payload, &["url", "postUrl", "productUrl"])
+        .map(|url| url.trim_end_matches('/').to_string());
+    let title = payload_text(&payload, &["title", "name"])
+        .map(|title| title.to_lowercase());
+
+    let item = launches.iter().find(|launch| {
+        let launch_id = launch.get("id").and_then(Value::as_str).unwrap_or_default();
+        let launch_url = launch
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim_end_matches('/');
+        let launch_title = launch
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_lowercase();
+        id.as_deref().is_some_and(|id| id == launch_id)
+            || url.as_deref().is_some_and(|url| url == launch_url)
+            || title.as_deref().is_some_and(|title| title == launch_title)
+    });
+
+    if let Some(item) = item {
+        return Ok(serde_json::json!({
+            "ok": true,
+            "functionId": function_id,
+            "source": "https://www.producthunt.com/feed",
+            "item": item,
+            "items": [item],
+            "reusedWorkers": reused_workers
+        }));
+    }
+
+    producthunt_search(function_id, payload, reused_workers)
 }
 
 fn producthunt_search(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
@@ -1938,6 +1981,9 @@ fn source_url(payload: &Value) -> String {
         }
     }
     if let Some(id) = payload_text(payload, &["clusterUrlId", "clusterId", "id"]) {
+        if id.starts_with("http://") || id.starts_with("https://") {
+            return same_origin_url(&id).unwrap_or_else(|| SOURCE_URL.to_string());
+        }
         return source_path(&id);
     }
     SOURCE_URL.to_string()
@@ -1959,11 +2005,16 @@ fn same_origin_url(url: &str) -> Option<String> {
 }
 
 fn source_path(path: &str) -> String {
-    let clean = path.trim().trim_start_matches('/').trim_start_matches("ai/");
+    let clean = path.trim();
     if clean.is_empty() {
         SOURCE_URL.to_string()
+    } else if clean.starts_with("http://") || clean.starts_with("https://") {
+        clean.to_string()
+    } else if clean.starts_with('/') {
+        let base = origin(SOURCE_URL).unwrap_or_else(|| SOURCE_URL.trim_end_matches('/').to_string());
+        format!("{}{}", base.trim_end_matches('/'), clean)
     } else {
-        format!("{}/{}", SOURCE_URL.trim_end_matches('/'), clean)
+        format!("{}/{}", SOURCE_URL.trim_end_matches('/'), clean.trim_start_matches('/'))
     }
 }
 
@@ -2529,6 +2580,20 @@ fn json_string_array(values: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("[{}]", values)
+}
+
+fn canonical_source_name(value: &str) -> String {
+    let compact = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    match compact.as_str() {
+        "hn" | "hackernews" => "hackernews".into(),
+        "producthunt" => "producthunt".into(),
+        "" => "source".into(),
+        _ => compact,
+    }
 }
 
 fn slugify(value: &str) -> String {

@@ -109,6 +109,322 @@ Call a registered generated function:
 cargo run --bin artifact -- call hackernews::top_stories --json '{"limit":10}'
 ```
 
+## Live generated worker demos
+
+These transcripts show the important path: Artifact CLI generates the worker, the generated Rust crate compiles, the worker registers with iii, and `iii trigger` returns live data. The exact stories and launch names will change as the public feeds change.
+
+Run the engine in one terminal:
+
+```bash
+iii --use-default-config --no-update-check
+```
+
+Expected engine signal:
+
+```text
+Engine listening on address: 0.0.0.0:49134
+```
+
+### Hacker News
+
+Generate and compile the worker:
+
+```bash
+cargo run --bin artifact -- generate \
+  --payload examples/hackernews.payload.json \
+  --out generated/hackernews-worker
+
+cd generated/hackernews-worker
+cargo check
+```
+
+Expected generation shape:
+
+```json
+{
+  "outputDir": "generated/hackernews-worker",
+  "workerPath": "generated/hackernews-worker/src/main.rs",
+  "manifestPath": "generated/hackernews-worker/artifact.manifest.json",
+  "plan": {
+    "workerName": "hackernews-worker",
+    "namespace": "hackernews",
+    "functions": [
+      { "functionId": "hackernews::top_stories" },
+      { "functionId": "hackernews::get_item" },
+      { "functionId": "hackernews::search_cached_stories" }
+    ]
+  }
+}
+```
+
+Run the generated worker in another terminal:
+
+```bash
+cd generated/hackernews-worker
+cargo run --quiet
+```
+
+Expected worker signal:
+
+```text
+hackernews-worker registered functions against ws://localhost:49134
+```
+
+Trigger it through iii:
+
+```bash
+iii trigger --use-default-config \
+  --function-id hackernews::top_stories \
+  --payload '{"limit":5}' \
+  --timeout-ms 30000
+```
+
+Sample live output:
+
+```json
+{
+  "functionId": "hackernews::top_stories",
+  "items": [
+    {
+      "rank": 1,
+      "title": "Googlebook",
+      "score": 223,
+      "comments": 293,
+      "url": "https://googlebook.google/"
+    },
+    {
+      "rank": 2,
+      "title": "CERT is releasing six CVEs for serious security vulnerabilities in dnsmasq",
+      "score": 68,
+      "comments": 9,
+      "url": "https://lists.thekelleys.org.uk/pipermail/dnsmasq-discuss/2026q2/018471.html"
+    }
+  ],
+  "ok": true,
+  "source": "https://hacker-news.firebaseio.com/v0/topstories.json"
+}
+```
+
+### Product Hunt
+
+Generate and compile the worker:
+
+```bash
+cargo run --bin artifact -- generate \
+  --payload examples/producthunt.payload.json \
+  --out generated/producthunt-worker
+
+cd generated/producthunt-worker
+cargo check
+```
+
+Expected generation shape:
+
+```json
+{
+  "outputDir": "generated/producthunt-worker",
+  "workerPath": "generated/producthunt-worker/src/main.rs",
+  "manifestPath": "generated/producthunt-worker/artifact.manifest.json",
+  "plan": {
+    "workerName": "producthunt-worker",
+    "namespace": "producthunt",
+    "functions": [
+      { "functionId": "producthunt::top_launches" },
+      { "functionId": "producthunt::launch_details" },
+      { "functionId": "producthunt::maker_lookup" },
+      { "functionId": "producthunt::topic_search" },
+      { "functionId": "producthunt::launch_metrics" }
+    ]
+  }
+}
+```
+
+Run the generated worker:
+
+```bash
+cd generated/producthunt-worker
+cargo run --quiet
+```
+
+Expected worker signal:
+
+```text
+producthunt-worker registered functions against ws://localhost:49134
+```
+
+Trigger top launches:
+
+```bash
+iii trigger --use-default-config \
+  --function-id producthunt::top_launches \
+  --payload '{"limit":3}' \
+  --timeout-ms 30000
+```
+
+Sample live output:
+
+```json
+{
+  "functionId": "producthunt::top_launches",
+  "items": [
+    {
+      "rank": 1,
+      "id": "1144799",
+      "title": "Free AI SEO Auditor",
+      "summary": "Audit your site for the AI search era. 100% Open Source",
+      "url": "https://www.producthunt.com/products/free-ai-seo-auditor"
+    },
+    {
+      "rank": 2,
+      "id": "1122747",
+      "title": "ARKAD Wallet",
+      "summary": "The budgeting app you'll actually use.",
+      "url": "https://www.producthunt.com/products/arkad-wallet"
+    }
+  ],
+  "ok": true,
+  "source": "https://www.producthunt.com/feed"
+}
+```
+
+Trigger exact launch details from one returned id:
+
+```bash
+iii trigger --use-default-config \
+  --function-id producthunt::launch_details \
+  --payload '{"id":"1144799"}' \
+  --timeout-ms 30000
+```
+
+Sample live output:
+
+```json
+{
+  "functionId": "producthunt::launch_details",
+  "item": {
+    "id": "1144799",
+    "rank": 1,
+    "title": "Free AI SEO Auditor",
+    "summary": "Audit your site for the AI search era. 100% Open Source",
+    "url": "https://www.producthunt.com/products/free-ai-seo-auditor"
+  },
+  "items": [
+    {
+      "id": "1144799",
+      "rank": 1,
+      "title": "Free AI SEO Auditor",
+      "summary": "Audit your site for the AI search era. 100% Open Source",
+      "url": "https://www.producthunt.com/products/free-ai-seo-auditor"
+    }
+  ],
+  "ok": true,
+  "source": "https://www.producthunt.com/feed"
+}
+```
+
+### Digg
+
+Generate and compile the worker:
+
+```bash
+cargo run --bin artifact -- generate \
+  --payload examples/digg.payload.json \
+  --out generated/digg-worker
+
+cd generated/digg-worker
+cargo check
+```
+
+Expected generation shape:
+
+```json
+{
+  "outputDir": "generated/digg-worker",
+  "workerPath": "generated/digg-worker/src/main.rs",
+  "manifestPath": "generated/digg-worker/artifact.manifest.json",
+  "plan": {
+    "workerName": "digg-worker",
+    "namespace": "digg",
+    "functions": [
+      { "functionId": "digg::top_stories" },
+      { "functionId": "digg::author_rank" },
+      { "functionId": "digg::search_stories" },
+      { "functionId": "digg::story_highlights" },
+      { "functionId": "digg::pipeline_status" }
+    ]
+  }
+}
+```
+
+Run the generated worker:
+
+```bash
+cd generated/digg-worker
+cargo run --quiet
+```
+
+Expected worker signal:
+
+```text
+digg-worker registered functions against ws://localhost:49134
+```
+
+Trigger top stories:
+
+```bash
+iii trigger --use-default-config \
+  --function-id digg::top_stories \
+  --payload '{"limit":3}' \
+  --timeout-ms 30000
+```
+
+Sample live output:
+
+```json
+{
+  "functionId": "digg::top_stories",
+  "items": [
+    {
+      "rank": 1,
+      "title": "Thinking Machines introduces Interaction Models for real-time collaboration",
+      "summary": "Roon Claims Slate Star Codex Served As Retrocausal Influencer Marketing"
+    },
+    {
+      "rank": 2,
+      "title": "Google detects first AI-developed zero-day exploit",
+      "summary": "Roon Claims Slate Star Codex Served As Retrocausal Influencer Marketing"
+    }
+  ],
+  "ok": true,
+  "source": "https://di.gg/ai"
+}
+```
+
+Trigger search and status:
+
+```bash
+iii trigger --use-default-config \
+  --function-id digg::search_stories \
+  --payload '{"query":"AI","limit":2}' \
+  --timeout-ms 30000
+
+iii trigger --use-default-config \
+  --function-id digg::pipeline_status \
+  --payload '{}' \
+  --timeout-ms 30000
+```
+
+Sample status output:
+
+```json
+{
+  "functionId": "digg::pipeline_status",
+  "ok": true,
+  "source": "https://di.gg/ai",
+  "status": "Posts:"
+}
+```
+
 ## Generated worker shape
 
 ```text

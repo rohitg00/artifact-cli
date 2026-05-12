@@ -112,6 +112,25 @@ fn infers_hackernews_functions_from_name_before_source_url_noise() {
 }
 
 #[test]
+fn generated_hackernews_alias_uses_specialized_handler() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = ArtifactInput {
+        name: "hacker_news".into(),
+        goal: Some("give agents focused access to top stories and item lookup".into()),
+        source_type: Some(SourceType::Docs),
+        source: Some("https://github.com/HackerNews/API".into()),
+        functions: vec!["top_stories".into(), "get_item".into()],
+        output_dir: Some(tmp.path().to_path_buf()),
+    };
+
+    let generated = generate_worker(input).unwrap();
+    let worker_source = std::fs::read_to_string(&generated.worker_path).unwrap();
+    assert!(worker_source.contains("const SOURCE_NAME: &str = \"hackernews\";"));
+    assert!(worker_source.contains("if SOURCE_NAME == \"hackernews\""));
+    assert!(worker_source.contains("handle_hackernews_function"));
+}
+
+#[test]
 fn infers_narrow_digg_worker_from_artifact_source() {
     let input = ArtifactInput {
         name: "digg".into(),
@@ -371,6 +390,8 @@ fn generated_digg_worker_uses_generic_live_source_template() {
     assert!(worker_source.contains("fn same_origin_url"));
     assert!(worker_source.contains("origin(candidate) == origin(SOURCE_URL)"));
     assert!(worker_source.contains("fn source_path"));
+    assert!(worker_source.contains("clean.starts_with('/')"));
+    assert!(!worker_source.contains("trim_start_matches(\"ai/\")"));
     assert!(worker_source.contains("let query_empty = query.is_empty();"));
     assert!(!worker_source.contains("handle_digg_function"));
     assert!(!worker_source.contains("format_digg"));
@@ -390,11 +411,15 @@ fn generated_digg_worker_uses_generic_live_source_template() {
 fn generated_public_url_worker_reuses_live_template_without_new_cli_code() {
     let tmp = tempfile::tempdir().unwrap();
     let input = ArtifactInput {
-        name: "producthunt".into(),
+        name: "product hunt".into(),
         goal: Some("daily launch tracking and maker lookup".into()),
         source_type: Some(SourceType::Docs),
         source: Some("https://www.producthunt.com".into()),
-        functions: vec!["top_launches".into(), "topic_search".into()],
+        functions: vec![
+            "top_launches".into(),
+            "launch_details".into(),
+            "topic_search".into(),
+        ],
         output_dir: Some(tmp.path().to_path_buf()),
     };
 
@@ -403,6 +428,12 @@ fn generated_public_url_worker_reuses_live_template_without_new_cli_code() {
     assert!(worker_source.contains("handle_source_function"));
     assert!(worker_source.contains("handle_producthunt_function"));
     assert!(worker_source.contains("https://www.producthunt.com/feed"));
+    assert!(worker_source.contains("const SOURCE_NAME: &str = \"producthunt\";"));
+    assert!(
+        worker_source.contains("return producthunt_details(function_id, payload, reused_workers);")
+    );
+    assert!(worker_source.contains("fn producthunt_details"));
+    assert!(worker_source.contains("payload_text(&payload, &[\"id\", \"postId\", \"productId\"]);"));
     assert!(worker_source.contains("source_top_items"));
     assert!(worker_source.contains("source_search"));
     assert!(worker_source.contains("const SOURCE_URL: &str = \"https://www.producthunt.com\";"));
