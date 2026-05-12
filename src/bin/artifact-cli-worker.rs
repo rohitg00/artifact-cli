@@ -180,6 +180,7 @@ fn parse_source_type(value: &str) -> anyhow::Result<SourceType> {
         "openapi" | "open_api" => Ok(SourceType::OpenApi),
         "graphql" => Ok(SourceType::Graphql),
         "har" => Ok(SourceType::Har),
+        "mcp" => Ok(SourceType::Mcp),
         "docs" => Ok(SourceType::Docs),
         "url" => Ok(SourceType::Url),
         "manual" => Ok(SourceType::Manual),

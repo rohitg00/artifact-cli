@@ -7,11 +7,12 @@ use std::path::{Path, PathBuf};
 pub type Result<T> = std::result::Result<T, ArtifactError>;
 
 pub const WORKER_NAME: &str = "artifact-cli-worker";
-pub const ARTIFACT_FUNCTION_IDS: [&str; 7] = [
+pub const ARTIFACT_FUNCTION_IDS: [&str; 8] = [
     "artifact::catalog",
     "artifact::recipes",
     "artifact::inspect",
     "artifact::plan_worker",
+    "artifact::convert",
     "artifact::generate_worker",
     "artifact::verify_worker",
     "artifact::manifest",
@@ -23,6 +24,8 @@ pub enum ArtifactError {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -31,6 +34,7 @@ pub enum SourceType {
     OpenApi,
     Graphql,
     Har,
+    Mcp,
     Docs,
     Url,
     #[default]
@@ -46,6 +50,21 @@ pub struct ArtifactInput {
     pub source: Option<String>,
     #[serde(default)]
     pub functions: Vec<String>,
+    pub output_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ConvertArtifactInput {
+    pub name: Option<String>,
+    pub goal: Option<String>,
+    #[serde(alias = "source_type")]
+    pub source_type: Option<SourceType>,
+    #[serde(alias = "url")]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub functions: Vec<String>,
+    #[serde(alias = "output_dir")]
     pub output_dir: Option<PathBuf>,
 }
 
@@ -256,8 +275,12 @@ pub fn register_artifact_primitives(iii: &iii_sdk::III) -> Vec<FunctionRef> {
                 .description("Create a narrow iii worker plan from an artifact description."),
         ),
         iii.register_function(
+            RegisterFunction::new("artifact::convert", convert_artifact)
+                .description("Convert a source, spec, docs page, HAR, or MCP server into a narrow Rust iii worker scaffold."),
+        ),
+        iii.register_function(
             RegisterFunction::new("artifact::generate_worker", generate_worker)
-                .description("Generate a Rust iii worker scaffold from an artifact plan."),
+                .description("Compatibility alias for artifact::convert when the payload already has a worker name."),
         ),
         iii.register_function(
             RegisterFunction::new("artifact::verify_worker", verify_worker)
@@ -607,6 +630,10 @@ pub fn artifact_manifest(input: ArtifactInput) -> Result<ArtifactManifestPreview
     })
 }
 
+pub fn convert_artifact(input: ConvertArtifactInput) -> Result<GeneratedWorker> {
+    generate_worker(input.into_artifact_input()?)
+}
+
 pub fn generate_worker(input: ArtifactInput) -> Result<GeneratedWorker> {
     let plan = plan_worker(input.clone())?;
     let output_dir = input
@@ -634,6 +661,34 @@ pub fn generate_worker(input: ArtifactInput) -> Result<GeneratedWorker> {
         manifest_path,
         plan,
     })
+}
+
+impl ConvertArtifactInput {
+    fn into_artifact_input(self) -> Result<ArtifactInput> {
+        let source = self.source;
+        let name = match (self.name, source.as_deref()) {
+            (Some(name), _) if !name.trim().is_empty() => name,
+            (_, Some(source)) if !source.trim().is_empty() => infer_name_from_source(source),
+            _ => {
+                return Err(ArtifactError::InvalidInput(
+                    "provide name or url/source for artifact::convert".into(),
+                ));
+            }
+        };
+        let source_type = self
+            .source_type
+            .or_else(|| source.as_deref().map(infer_source_type_from_source))
+            .unwrap_or_default();
+
+        Ok(ArtifactInput {
+            name,
+            goal: self.goal,
+            source_type: Some(source_type),
+            source,
+            functions: self.functions,
+            output_dir: self.output_dir,
+        })
+    }
 }
 
 pub fn verify_worker(input: VerifyWorkerInput) -> Result<VerificationReport> {
@@ -1069,6 +1124,10 @@ fn infer_capabilities(input: &ArtifactInput, functions: &[String]) -> Vec<String
         SourceType::OpenApi | SourceType::Graphql | SourceType::Har | SourceType::Url => {
             push_unique(&mut capabilities, "http");
         }
+        SourceType::Mcp => {
+            push_unique(&mut capabilities, "mcp");
+            push_unique(&mut capabilities, "http");
+        }
         SourceType::Docs | SourceType::Manual => {
             push_unique(&mut capabilities, "docs");
             push_unique(&mut capabilities, "filesystem");
@@ -1187,6 +1246,62 @@ fn reuse_worker_names(reuse_plan: &ReusePlan) -> Vec<String> {
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn infer_source_type_from_source(source: &str) -> SourceType {
+    let lower = source.to_lowercase();
+    if lower.contains("mcp") {
+        SourceType::Mcp
+    } else if lower.starts_with("http://") || lower.starts_with("https://") {
+        SourceType::Url
+    } else {
+        SourceType::Manual
+    }
+}
+
+fn infer_name_from_source(source: &str) -> String {
+    let lower_source = source.to_lowercase();
+    if let Some(recipe) = worker_recipes().into_iter().find(|recipe| {
+        recipe
+            .source_hints
+            .iter()
+            .any(|hint| lower_source.contains(&hint.to_lowercase()))
+            || recipe.research_links.iter().any(|link| {
+                let lower_link = link.to_lowercase();
+                lower_source.contains(&lower_link) || lower_link.contains(&lower_source)
+            })
+    }) {
+        return recipe.name;
+    }
+
+    let no_scheme = source
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let no_query = no_scheme.split(['?', '#']).next().unwrap_or(no_scheme);
+    let parts = no_query
+        .trim_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+
+    if parts.len() >= 5 && parts[0].contains("github.com") && matches!(parts[3], "tree" | "blob") {
+        return parts.last().copied().unwrap_or("artifact").to_string();
+    }
+
+    if parts.len() >= 3 && parts[0].contains("github.com") {
+        return format!("{}-{}", parts[1], parts[2]);
+    }
+
+    parts
+        .last()
+        .copied()
+        .filter(|part| !part.is_empty())
+        .unwrap_or("artifact")
+        .trim_end_matches(".json")
+        .trim_end_matches(".yaml")
+        .trim_end_matches(".yml")
+        .to_string()
 }
 
 fn push_unique(values: &mut Vec<String>, value: &str) {
