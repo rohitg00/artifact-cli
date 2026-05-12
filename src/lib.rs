@@ -1253,71 +1253,104 @@ fn matching_recipe(name: &str, haystack: &str) -> Option<WorkerRecipe> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FunctionIntent {
+    Top,
+    Search,
+    Highlight,
+    Lookup,
+    Status,
+    Sync,
+    Generic,
+}
+
+fn classify_intent(clean: &str) -> FunctionIntent {
+    let tokens = clean
+        .split('_')
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let has_any = |needles: &[&str]| {
+        tokens
+            .iter()
+            .any(|token| needles.iter().any(|needle| token == needle))
+    };
+
+    if has_any(&["sync", "refresh"]) {
+        FunctionIntent::Sync
+    } else if has_any(&[
+        "highlight",
+        "highlights",
+        "summary",
+        "summaries",
+        "brief",
+        "digest",
+    ]) {
+        FunctionIntent::Highlight
+    } else if has_any(&["status", "pipeline", "health", "metric", "metrics"]) {
+        FunctionIntent::Status
+    } else if has_any(&[
+        "lookup", "rank", "author", "maker", "profile", "detail", "details", "item", "person",
+        "handle",
+    ]) {
+        FunctionIntent::Lookup
+    } else if has_any(&["search", "query", "topic"]) {
+        FunctionIntent::Search
+    } else if has_any(&[
+        "top", "trend", "trends", "trending", "popular", "latest", "launch", "launches",
+    ]) {
+        FunctionIntent::Top
+    } else {
+        FunctionIntent::Generic
+    }
+}
+
 fn plan_function(namespace: &str, function: &str) -> WorkerFunctionPlan {
     let clean = slugify(function);
-    let sync_like = clean.contains("sync") || clean.contains("refresh");
-    let top_like = clean.contains("top") || clean.contains("trend") || clean.contains("launch");
-    let search_like = clean.contains("search") || clean.contains("lookup");
-    let highlight_like = clean.contains("highlight")
-        || clean.contains("summary")
-        || clean.contains("brief")
-        || clean.contains("digest");
-    let rank_like = clean.contains("rank")
-        || clean.contains("author")
-        || clean.contains("maker")
-        || clean.contains("profile");
-    let status_like =
-        clean.contains("status") || clean.contains("pipeline") || clean.contains("health");
-    let (purpose, inputs, output) = if top_like {
-        (
+    let intent = classify_intent(&clean);
+    let (purpose, inputs, output) = match intent {
+        FunctionIntent::Top => (
             format!(
                 "Return top {} items for agent summaries.",
                 titleize(namespace)
             ),
             serde_json::json!({ "limit": "number optional; default 10", "window": "string optional; today|24h|7d" }),
             serde_json::json!({ "items": "ranked public items with title, summary, rank, and source URL" }),
-        )
-    } else if search_like {
-        (
+        ),
+        FunctionIntent::Search => (
             format!("Search {} source data with citations.", titleize(namespace)),
             serde_json::json!({ "query": "string topic", "limit": "number optional", "since": "string optional duration like 24h or 7d" }),
             serde_json::json!({ "matches": "ranked matches with title, summary, and source URL" }),
-        )
-    } else if highlight_like {
-        (
+        ),
+        FunctionIntent::Highlight => (
             format!(
                 "Create a concise {} highlight artifact from a URL or structured thread payload.",
                 titleize(namespace)
             ),
             serde_json::json!({ "url": "string optional", "id": "string optional", "threadId": "string optional", "prompt": "object optional", "replies": "array optional" }),
             serde_json::json!({ "text": "monospace-friendly highlight artifact", "source": "source URL when fetched" }),
-        )
-    } else if rank_like {
-        (
+        ),
+        FunctionIntent::Lookup => (
             format!(
                 "Look up a person, author, maker, or handle in {} source data.",
                 titleize(namespace)
             ),
             serde_json::json!({ "handle": "string optional", "name": "string optional", "query": "string optional" }),
             serde_json::json!({ "match": "best matching public source line with context" }),
-        )
-    } else if status_like {
-        (
+        ),
+        FunctionIntent::Status => (
             format!(
                 "Read {} public source status and recent visible signals.",
                 titleize(namespace)
             ),
             serde_json::json!({ "watch": "boolean optional", "since": "string optional duration" }),
             serde_json::json!({ "status": "short source reachability/status summary" }),
-        )
-    } else if sync_like {
-        (
+        ),
+        FunctionIntent::Sync => (
             format!("Sync source data for the {} worker.", namespace),
             serde_json::json!({ "force": "boolean optional; bypass cache when true" }),
             serde_json::json!({ "ok": "boolean success flag", "synced": "sync result payload" }),
-        )
-    } else {
-        (
+        ),
+        FunctionIntent::Generic => (
             format!("{} for the {} worker", titleize(&clean), namespace),
             serde_json::json!({ "query": "string/object; focused request payload for this function" }),
             serde_json::json!({
@@ -1325,13 +1358,13 @@ fn plan_function(namespace: &str, function: &str) -> WorkerFunctionPlan {
                 "data": "function-specific result payload",
                 "sources": "optional source/provenance list"
             }),
-        )
+        ),
     };
 
     WorkerFunctionPlan {
         function_id: format!("{}::{}", namespace, clean),
         purpose,
-        side_effects: if sync_like {
+        side_effects: if matches!(intent, FunctionIntent::Sync) {
             SideEffects::Sync
         } else {
             SideEffects::ExternalCall
@@ -1455,6 +1488,13 @@ fn handle_source_function(
     payload: Value,
     reused_workers: Value,
 ) -> Result<Value, String> {
+    if SOURCE_NAME == "hackernews" {
+        return handle_hackernews_function(function_id, function_name, payload, reused_workers);
+    }
+    if SOURCE_NAME == "producthunt" {
+        return handle_producthunt_function(function_id, function_name, payload, reused_workers);
+    }
+
     if has_thread_payload(&payload)
         || function_name.contains("highlight")
         || function_name.contains("summary")
@@ -1487,6 +1527,273 @@ fn handle_source_function(
         return source_status(function_id, payload, reused_workers);
     }
     source_lookup(function_id, payload, reused_workers)
+}
+
+fn handle_hackernews_function(
+    function_id: &str,
+    function_name: &str,
+    payload: Value,
+    reused_workers: Value,
+) -> Result<Value, String> {
+    if function_name.contains("top") || function_name.contains("list") {
+        return hackernews_top_stories(function_id, payload, reused_workers);
+    }
+    if function_name.contains("search") {
+        return hackernews_search(function_id, payload, reused_workers);
+    }
+    if function_name.contains("item") || function_name.contains("get") || function_name.contains("lookup") {
+        return hackernews_get_item(function_id, payload, reused_workers);
+    }
+    hackernews_search(function_id, payload, reused_workers)
+}
+
+fn hackernews_top_stories(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
+    let limit = payload_number(&payload, "limit").unwrap_or(10).clamp(1, 30) as usize;
+    let ids = fetch_json("https://hacker-news.firebaseio.com/v0/topstories.json")?;
+    let mut items = Vec::new();
+    if let Some(ids) = ids.as_array() {
+        for id in ids.iter().filter_map(Value::as_i64).take(limit) {
+            if let Ok(item) = hackernews_item(id) {
+                items.push(hackernews_story_value(items.len() + 1, &item));
+            }
+        }
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "functionId": function_id,
+        "source": "https://hacker-news.firebaseio.com/v0/topstories.json",
+        "items": items,
+        "reusedWorkers": reused_workers
+    }))
+}
+
+fn hackernews_get_item(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
+    if let Some(id) = payload_number(&payload, "id").or_else(|| payload_text(&payload, &["id"]).and_then(|id| id.parse::<i64>().ok())) {
+        let item = hackernews_item(id)?;
+        return Ok(serde_json::json!({
+            "ok": true,
+            "functionId": function_id,
+            "source": format!("https://hacker-news.firebaseio.com/v0/item/{id}.json"),
+            "item": hackernews_story_value(1, &item),
+            "raw": item,
+            "reusedWorkers": reused_workers
+        }));
+    }
+    if payload_text(&payload, &["query", "q", "title"]).is_some() {
+        return hackernews_search(function_id, payload, reused_workers);
+    }
+    Ok(serde_json::json!({
+        "ok": false,
+        "functionId": function_id,
+        "error": "provide an HN item id or query",
+        "reusedWorkers": reused_workers
+    }))
+}
+
+fn hackernews_search(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
+    let query = payload_text(&payload, &["query", "q", "title"]).unwrap_or_default();
+    let limit = payload_number(&payload, "limit").unwrap_or(10).clamp(1, 30) as usize;
+    let url = format!(
+        "https://hn.algolia.com/api/v1/search?tags=story&query={}",
+        url_encode(&query)
+    );
+    let data = fetch_json(&url)?;
+    let mut matches = Vec::new();
+    if let Some(hits) = data.get("hits").and_then(Value::as_array) {
+        for hit in hits.iter().take(limit) {
+            matches.push(serde_json::json!({
+                "id": hit.get("objectID").and_then(Value::as_str).unwrap_or_default(),
+                "title": hit.get("title").and_then(Value::as_str).or_else(|| hit.get("story_title").and_then(Value::as_str)).unwrap_or_default(),
+                "url": hit.get("url").and_then(Value::as_str).or_else(|| hit.get("story_url").and_then(Value::as_str)).unwrap_or_default(),
+                "author": hit.get("author").and_then(Value::as_str).unwrap_or_default(),
+                "points": hit.get("points").and_then(Value::as_i64).unwrap_or_default(),
+                "comments": hit.get("num_comments").and_then(Value::as_i64).unwrap_or_default(),
+                "createdAt": hit.get("created_at").and_then(Value::as_str).unwrap_or_default()
+            }));
+        }
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "functionId": function_id,
+        "query": query,
+        "source": url,
+        "matches": matches,
+        "reusedWorkers": reused_workers
+    }))
+}
+
+fn hackernews_item(id: i64) -> Result<Value, String> {
+    fetch_json(&format!("https://hacker-news.firebaseio.com/v0/item/{id}.json"))
+}
+
+fn hackernews_story_value(rank: usize, item: &Value) -> Value {
+    let id = item.get("id").and_then(Value::as_i64).unwrap_or_default();
+    serde_json::json!({
+        "rank": rank,
+        "id": id,
+        "title": item.get("title").and_then(Value::as_str).unwrap_or_default(),
+        "url": item.get("url").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("https://news.ycombinator.com/item?id={id}")),
+        "author": item.get("by").and_then(Value::as_str).unwrap_or_default(),
+        "score": item.get("score").and_then(Value::as_i64).unwrap_or_default(),
+        "comments": item.get("descendants").and_then(Value::as_i64).unwrap_or_default(),
+        "time": item.get("time").and_then(Value::as_i64).unwrap_or_default(),
+        "type": item.get("type").and_then(Value::as_str).unwrap_or_default()
+    })
+}
+
+fn handle_producthunt_function(
+    function_id: &str,
+    function_name: &str,
+    payload: Value,
+    reused_workers: Value,
+) -> Result<Value, String> {
+    if function_name.contains("search") || function_name.contains("lookup") || function_name.contains("detail") {
+        return producthunt_search(function_id, payload, reused_workers);
+    }
+    if function_name.contains("metric") || function_name.contains("status") {
+        return producthunt_metrics(function_id, payload, reused_workers);
+    }
+    producthunt_top_launches(function_id, payload, reused_workers)
+}
+
+fn producthunt_top_launches(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
+    let limit = payload_number(&payload, "limit").unwrap_or(10).clamp(1, 30) as usize;
+    let feed = fetch_text("https://www.producthunt.com/feed")?;
+    let launches = producthunt_feed_items(&feed, limit);
+    Ok(serde_json::json!({
+        "ok": true,
+        "functionId": function_id,
+        "source": "https://www.producthunt.com/feed",
+        "items": launches,
+        "reusedWorkers": reused_workers
+    }))
+}
+
+fn producthunt_search(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
+    let query = payload_text(&payload, &["query", "q", "topic", "name", "handle"]).unwrap_or_default();
+    let lower_query = query.to_lowercase();
+    let limit = payload_number(&payload, "limit").unwrap_or(10).clamp(1, 30) as usize;
+    let feed = fetch_text("https://www.producthunt.com/feed")?;
+    let mut matches = producthunt_feed_items(&feed, 60)
+        .into_iter()
+        .filter(|item| {
+            if lower_query.is_empty() {
+                true
+            } else {
+                item.get("title").and_then(Value::as_str).unwrap_or_default().to_lowercase().contains(&lower_query)
+                    || item.get("summary").and_then(Value::as_str).unwrap_or_default().to_lowercase().contains(&lower_query)
+                    || item.get("author").and_then(Value::as_str).unwrap_or_default().to_lowercase().contains(&lower_query)
+            }
+        })
+        .collect::<Vec<_>>();
+    matches.truncate(limit);
+    Ok(serde_json::json!({
+        "ok": true,
+        "functionId": function_id,
+        "query": query,
+        "source": "https://www.producthunt.com/feed",
+        "matches": matches,
+        "reusedWorkers": reused_workers
+    }))
+}
+
+fn producthunt_metrics(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
+    let feed = fetch_text("https://www.producthunt.com/feed")?;
+    let limit = payload_number(&payload, "limit").unwrap_or(10).clamp(1, 30) as usize;
+    let launches = producthunt_feed_items(&feed, limit);
+    Ok(serde_json::json!({
+        "ok": true,
+        "functionId": function_id,
+        "source": "https://www.producthunt.com/feed",
+        "updated": xml_tag(&feed, "updated"),
+        "launchCount": launches.len(),
+        "recentLaunches": launches,
+        "reusedWorkers": reused_workers
+    }))
+}
+
+fn producthunt_feed_items(feed: &str, limit: usize) -> Vec<Value> {
+    let mut items = Vec::new();
+    for entry in feed.split("<entry>").skip(1) {
+        let entry = entry.split("</entry>").next().unwrap_or(entry);
+        let title = xml_tag(entry, "title").unwrap_or_default();
+        if title.is_empty() {
+            continue;
+        }
+        let content = xml_tag(entry, "content").unwrap_or_default();
+        let summary = first_clean_text(&content);
+        items.push(serde_json::json!({
+            "rank": items.len() + 1,
+            "id": producthunt_post_id(entry).unwrap_or_default(),
+            "title": title,
+            "summary": summary,
+            "url": xml_link_href(entry).unwrap_or_default(),
+            "author": xml_author(entry).unwrap_or_default(),
+            "published": xml_tag(entry, "published").unwrap_or_default(),
+            "updated": xml_tag(entry, "updated").unwrap_or_default()
+        }));
+        if items.len() >= limit {
+            break;
+        }
+    }
+    items
+}
+
+fn producthunt_post_id(entry: &str) -> Option<String> {
+    xml_tag(entry, "id")
+        .and_then(|id| id.rsplit('/').next().map(str::to_string))
+        .filter(|id| !id.is_empty())
+}
+
+fn xml_author(entry: &str) -> Option<String> {
+    let author = entry.split("<author>").nth(1)?.split("</author>").next()?;
+    xml_tag(author, "name")
+}
+
+fn xml_link_href(entry: &str) -> Option<String> {
+    for line in entry.lines() {
+        if line.contains("<link") && line.contains("rel=\"alternate\"") {
+            let rest = line.split("href=\"").nth(1)?;
+            return rest.split('"').next().map(str::to_string);
+        }
+    }
+    None
+}
+
+fn xml_tag(text: &str, tag: &str) -> Option<String> {
+    let marker = format!("<{tag}");
+    let start = text.find(&marker)?;
+    let after = &text[start + marker.len()..];
+    let value_start = after.find('>')? + 1;
+    let body = &after[value_start..];
+    let end = body.find(&format!("</{tag}>"))?;
+    Some(decode_entities(body[..end].trim()).trim().to_string())
+}
+
+fn first_clean_text(value: &str) -> String {
+    clean_lines(&html_to_text(&decode_entities(value)))
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
+fn fetch_json(url: &str) -> Result<Value, String> {
+    let text = fetch_text(url)?;
+    serde_json::from_str(&text).map_err(|error| format!("{url}: {error}"))
+}
+
+fn url_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            b' ' => encoded.push('+'),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn source_top_items(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
@@ -1626,15 +1933,53 @@ fn fetch_text(url: &str) -> Result<String, String> {
 
 fn source_url(payload: &Value) -> String {
     if let Some(url) = payload_text(payload, &["url", "storyUrl", "postUrl"]) {
-        if url.starts_with("http://") || url.starts_with("https://") {
+        if let Some(url) = same_origin_url(&url) {
             return url;
         }
     }
     if let Some(id) = payload_text(payload, &["clusterUrlId", "clusterId", "id"]) {
-        let clean = id.trim().trim_start_matches('/').trim_start_matches("ai/");
-        return format!("{}/{}", SOURCE_URL.trim_end_matches('/'), clean);
+        return source_path(&id);
     }
     SOURCE_URL.to_string()
+}
+
+fn same_origin_url(url: &str) -> Option<String> {
+    let candidate = url.trim();
+    if candidate.is_empty() || candidate.starts_with("//") {
+        return None;
+    }
+    if !(candidate.starts_with("http://") || candidate.starts_with("https://")) {
+        return Some(source_path(candidate));
+    }
+    if origin(candidate).is_some() && origin(candidate) == origin(SOURCE_URL) {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
+fn source_path(path: &str) -> String {
+    let clean = path.trim().trim_start_matches('/').trim_start_matches("ai/");
+    if clean.is_empty() {
+        SOURCE_URL.to_string()
+    } else {
+        format!("{}/{}", SOURCE_URL.trim_end_matches('/'), clean)
+    }
+}
+
+fn origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority = rest
+        .split(|ch| matches!(ch, '/' | '?' | '#'))
+        .next()?
+        .to_lowercase();
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    Some(format!("{}://{}", scheme.to_lowercase(), authority))
 }
 
 fn has_thread_payload(payload: &Value) -> bool {
@@ -1965,11 +2310,14 @@ fn first_long_paragraph(text: &str, title: &str) -> Option<String> {
 
 fn find_matching_line(text: &str, query: &str) -> Option<String> {
     let query = query.to_lowercase();
+    let query_empty = query.is_empty();
     clean_lines(text).into_iter().find(|line| {
-        query.is_empty()
-            || line.to_lowercase().contains(&query)
-            || line.starts_with('#')
-            || line.to_lowercase().contains("rank")
+        let lower = line.to_lowercase();
+        if query_empty {
+            line.starts_with('#') || lower.contains("rank")
+        } else {
+            lower.contains(&query)
+        }
     })
 }
 
