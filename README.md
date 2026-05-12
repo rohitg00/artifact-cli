@@ -40,6 +40,21 @@ iii trigger --function-id artifact::convert --payload '{
 
 The standalone `artifact` binary is a development convenience for local generation, verification, and demos. It is not the intended primary user interface.
 
+## Install From Source
+
+Artifact is still pre-v1, so install from the repo while the worker surface stabilizes:
+
+```bash
+cargo install --git https://github.com/rohitg00/artifact-cli --bin artifact-cli-worker
+artifact-cli-worker serve --iii-url ws://localhost:49134
+```
+
+Install the development binary only when you are working on generator internals or local demos:
+
+```bash
+cargo install --git https://github.com/rohitg00/artifact-cli --bin artifact
+```
+
 ## Why this exists
 
 Agents are better when they call stable functions instead of browsing docs, guessing endpoints, or stitching workflows from scratch. `artifact::convert` creates small iii-native Rust workers around a specific job:
@@ -63,6 +78,25 @@ Artifact composes with prebuilt iii surfaces instead of rebuilding platform plum
 - `iii-hq/workers` modules — credentials, shell, filesystem, database, MCP, skills, proof, model providers, hooks, sessions, policy
 
 The generated worker should only own the artifact-specific function logic. Storage, async execution, auth, local mirrors, browser verification, MCP exposure, and observability are delegated to reusable workers.
+
+## What Must Be True For v1
+
+Artifact is on the right path when these stay true:
+
+- `artifact::convert` is the default public entrypoint; development binaries never become the main product surface.
+- MCP input becomes narrow worker functions, not another broad MCP proxy.
+- Every generated worker compiles, registers explicit `namespace::function` IDs, and can be called through `iii trigger`.
+- Every generated worker ships `artifact.manifest.json`, `iii.worker.yaml`, `README.md`, and a reuse plan for existing iii workers.
+- Public examples show terminal commands and real output for generated workers.
+- Blank, malformed, or unsafe inputs fail before they are persisted into manifests.
+
+Still missing before v1:
+
+- MCP introspection: connect to an MCP server, read its tool schemas, and generate typed worker adapters automatically.
+- HTTP trigger binding: emit or document the iii HTTP trigger mapping for selected generated functions.
+- Package release: publish the worker binary as the install target and keep `artifact` as an optional development helper.
+- CI gates: `cargo fmt`, `cargo test`, `cargo clippy`, and generated-worker `cargo check` for the public fixtures.
+- Security policy: explicit allowlists for external sources, MCP endpoints, credentials, and generated write-capable functions.
 
 ## Current Rust iii primitives
 
