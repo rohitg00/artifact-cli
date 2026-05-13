@@ -1,22 +1,22 @@
-use iii_sdk::{FunctionRef, InitOptions, RegisterFunction, RegisterServiceMessage, WorkerMetadata};
+use iii_sdk::{
+    FunctionRef, HttpInvocationConfig, HttpMethod, InitOptions, RegisterFunction,
+    RegisterFunctionMessage, RegisterServiceMessage, WorkerMetadata,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 
 pub type Result<T> = std::result::Result<T, ArtifactError>;
 
 pub const WORKER_NAME: &str = "artifact-worker";
-pub const ARTIFACT_FUNCTION_IDS: [&str; 8] = [
-    "artifact::catalog",
-    "artifact::recipes",
-    "artifact::inspect",
-    "artifact::plan_worker",
-    "artifact::convert",
-    "artifact::generate_worker",
-    "artifact::verify_worker",
-    "artifact::manifest",
-];
+pub const ARTIFACT_FUNCTION_IDS: [&str; 1] = ["artifact::convert"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArtifactError {
@@ -41,18 +41,6 @@ pub enum SourceType {
     Manual,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ArtifactInput {
-    pub name: String,
-    pub goal: Option<String>,
-    pub source_type: Option<SourceType>,
-    pub source: Option<String>,
-    #[serde(default)]
-    pub functions: Vec<String>,
-    pub output_dir: Option<PathBuf>,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ConvertArtifactInput {
@@ -62,156 +50,133 @@ pub struct ConvertArtifactInput {
     pub source_type: Option<SourceType>,
     #[serde(alias = "url")]
     pub source: Option<String>,
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
     #[serde(default)]
     pub functions: Vec<String>,
-    #[serde(alias = "output_dir")]
-    pub output_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactSource {
+    worker_name: String,
+    namespace: String,
+    source_type: SourceType,
+    source: Option<String>,
+    command: Option<String>,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    functions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct VerifyWorkerInput {
-    pub output_dir: PathBuf,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub enum SideEffects {
-    Read,
-    Write,
-    Sync,
-    ExternalCall,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ReusableWorker {
-    pub name: String,
-    pub source: String,
-    pub install: Option<String>,
-    pub purpose: String,
-    pub capabilities: Vec<String>,
-    pub functions: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkerCatalog {
-    pub engine_builtins: Vec<ReusableWorker>,
-    pub installable_workers: Vec<ReusableWorker>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkerRecipe {
-    pub name: String,
-    pub category: String,
-    pub stage: RecipeStage,
-    pub priority: u8,
-    pub integration: String,
-    pub goal: String,
-    pub source_hints: Vec<String>,
-    pub default_functions: Vec<String>,
-    pub research_links: Vec<String>,
-    pub rationale: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum RecipeStage {
-    BuildNow,
-    ResearchFirst,
-    Later,
-}
-
-type WorkerRecipeDetails<'a> = (&'a str, &'a str, &'a str);
-type WorkerRecipeSources<'a> = (&'a [&'a str], &'a [&'a str], &'a [&'a str]);
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ReusePlan {
-    pub engine_builtins: Vec<ReusableWorker>,
-    pub installable_workers: Vec<ReusableWorker>,
-    pub missing_capabilities: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkerFunctionPlan {
+pub struct VirtualFunctionRegistration {
     pub function_id: String,
-    pub purpose: String,
-    pub side_effects: SideEffects,
-    pub inputs: serde_json::Value,
-    pub output: serde_json::Value,
+    pub url: String,
+    pub method: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkerPlan {
-    pub worker_name: String,
-    pub namespace: String,
-    pub source_type: SourceType,
-    pub source: Option<String>,
-    pub goal: String,
-    pub functions: Vec<WorkerFunctionPlan>,
-    pub uses_workers: Vec<String>,
-    pub reuse_plan: ReusePlan,
-    pub notes: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct InspectResult {
-    pub name: String,
-    pub namespace: String,
-    pub source_type: SourceType,
-    pub source: Option<String>,
-    pub suggested_functions: Vec<String>,
-    pub recommendation: String,
-    pub existing_workers_to_use: Vec<String>,
-    pub reuse_plan: ReusePlan,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct GeneratedWorker {
-    pub output_dir: PathBuf,
-    pub worker_path: PathBuf,
-    pub manifest_path: PathBuf,
-    pub plan: WorkerPlan,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct VerificationReport {
-    pub ok: bool,
-    pub worker_path: PathBuf,
-    pub function_count: usize,
-    pub missing_registrations: Vec<String>,
-    pub missing_files: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ArtifactManifestPreview {
+pub struct VirtualWorkerManifest {
     pub schema: String,
     pub worker_name: String,
     pub namespace: String,
-    pub functions: Vec<WorkerFunctionPlan>,
-    pub uses_workers: Vec<String>,
-    pub reuse_plan: ReusePlan,
+    pub source_type: SourceType,
+    pub source: Option<String>,
+    pub functions: Vec<VirtualFunctionRegistration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkerInstallPlan {
+pub struct ArtifactConversion {
     pub ok: bool,
+    pub mode: String,
     pub worker_name: String,
-    pub worker_dir: PathBuf,
-    pub dependencies: Vec<ReusableWorker>,
-    pub commands: Vec<String>,
-    pub verification: VerificationReport,
+    pub namespace: String,
+    pub source_type: SourceType,
+    pub source: Option<String>,
+    pub function_count: usize,
+    pub registered_functions: Vec<VirtualFunctionRegistration>,
+    pub manifest: VirtualWorkerManifest,
+    pub notes: Vec<String>,
 }
+
+#[derive(Debug, Clone)]
+struct VirtualHttpFunction {
+    function_id: String,
+    url: String,
+    method: HttpMethod,
+    mcp_transport: Option<McpTransport>,
+    invocation: VirtualInvocation,
+    description: String,
+    request_format: Option<Value>,
+    response_format: Option<Value>,
+    metadata: Value,
+}
+
+#[derive(Debug, Clone)]
+enum VirtualInvocation {
+    Http,
+    McpTool { tool_name: String },
+    McpToolsList,
+    McpToolCall,
+}
+
+#[derive(Debug, Clone)]
+enum McpTransport {
+    Http(String),
+    Stdio(McpStdioConfig),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct McpStdioConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpToolSpec {
+    name: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default = "empty_object_schema", alias = "input_schema")]
+    input_schema: Value,
+    #[serde(default, alias = "output_schema")]
+    output_schema: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpListToolsResult {
+    #[serde(default)]
+    tools: Vec<McpToolSpec>,
+}
+
+#[derive(Clone)]
+struct BridgeServer {
+    base_url: String,
+    functions: Arc<Mutex<HashMap<String, VirtualHttpFunction>>>,
+}
+
+struct BridgeRequest {
+    path: String,
+    body: Vec<u8>,
+}
+
+static VIRTUAL_BRIDGE: OnceLock<Mutex<Option<BridgeServer>>> = OnceLock::new();
+static GENERATED_FUNCTION_REFS: OnceLock<Mutex<HashMap<String, FunctionRef>>> = OnceLock::new();
 
 pub fn registered_function_ids() -> Vec<&'static str> {
     ARTIFACT_FUNCTION_IDS.to_vec()
@@ -245,426 +210,49 @@ pub fn register_artifact_primitives(iii: &iii_sdk::III) -> Vec<FunctionRef> {
     iii.register_service(RegisterServiceMessage {
         id: WORKER_NAME.into(),
         name: "Artifact Worker".into(),
-        description: Some("Plan, generate, verify, and manifest narrow Rust iii workers.".into()),
+        description: Some(
+            "Convert OpenAPI specs and MCP servers into triggerable iii functions.".into(),
+        ),
         parent_service_id: None,
     });
 
-    vec![
-        iii.register_function(
-            RegisterFunction::new(
-                "artifact::catalog",
-                |_payload: serde_json::Value| -> Result<WorkerCatalog> { Ok(worker_catalog()) },
-            )
-            .description(
-                "List iii engine builtins and reusable iii-hq/workers for Artifact.",
-            ),
-        ),
-        iii.register_function(
-            RegisterFunction::new(
-                "artifact::recipes",
-                |_payload: serde_json::Value| -> Result<Vec<WorkerRecipe>> { Ok(worker_recipes()) },
-            )
-            .description("List narrow worker recipes Artifact can generate."),
-        ),
-        iii.register_function(
-            RegisterFunction::new("artifact::inspect", inspect_artifact)
-                .description("Inspect an artifact source and suggest narrow iii worker functions."),
-        ),
-        iii.register_function(
-            RegisterFunction::new("artifact::plan_worker", plan_worker)
-                .description("Create a narrow iii worker plan from an artifact description."),
-        ),
-        iii.register_function(
-            RegisterFunction::new("artifact::convert", convert_artifact)
-                .description("Convert a source, spec, docs page, HAR, or MCP server into a narrow Rust iii worker scaffold."),
-        ),
-        iii.register_function(
-            RegisterFunction::new("artifact::generate_worker", generate_worker)
-                .description("Compatibility alias for artifact::convert when the payload already has a worker name."),
-        ),
-        iii.register_function(
-            RegisterFunction::new("artifact::verify_worker", verify_worker)
-                .description("Run structural verification on a generated artifact worker."),
-        ),
-        iii.register_function(
-            RegisterFunction::new("artifact::manifest", artifact_manifest)
-                .description("Create a manifest preview for a generated artifact worker."),
-        ),
-    ]
+    let convert_iii = iii.clone();
+    vec![iii.register_function(
+        RegisterFunction::new("artifact::convert", move |input: ConvertArtifactInput| {
+            convert_artifact_for_iii(&convert_iii, input)
+        })
+        .description("Convert an OpenAPI spec or MCP server into triggerable iii functions."),
+    )]
 }
 
-pub fn worker_catalog() -> WorkerCatalog {
-    WorkerCatalog {
-        engine_builtins: engine_builtin_catalog(),
-        installable_workers: installable_worker_catalog(),
+pub fn convert_artifact_for_iii(
+    iii: &iii_sdk::III,
+    input: ConvertArtifactInput,
+) -> Result<ArtifactConversion> {
+    let artifact = input.into_artifact_source()?;
+    match artifact.source_type {
+        SourceType::OpenApi => register_openapi_virtual_worker(iii, artifact),
+        SourceType::Mcp => register_mcp_virtual_worker(iii, artifact),
+        other => Err(ArtifactError::InvalidInput(format!(
+            "artifact::convert supports open_api and mcp sources; got {other:?}"
+        ))),
     }
 }
 
-pub fn worker_recipes() -> Vec<WorkerRecipe> {
-    vec![
-        worker_recipe(
-            "digg",
-            "media",
-            RecipeStage::BuildNow,
-            95,
-            (
-                "public web dataset",
-                "Answer top stories, AI 1000 rank lookup, story search, highlights, and pipeline status.",
-                "Small read-only surface with obvious agent questions and no account setup requirement.",
-            ),
-            (
-                &["digg", "di.gg", "ai 1000"],
-                &[
-                    "top_stories",
-                    "author_rank",
-                    "search_stories",
-                    "story_highlights",
-                    "pipeline_status",
-                ],
-                &["https://di.gg/ai"],
-            ),
-        ),
-        worker_recipe(
-            "hackernews",
-            "media",
-            RecipeStage::BuildNow,
-            100,
-            (
-                "public read-only Firebase JSON",
-                "Give agents focused access to top stories, item lookup, and cached story search.",
-                "Canonical public API, no auth, stable repeated workflows, and a tiny worker surface.",
-            ),
-            (
-                &["hackernews", "hacker news", "news.ycombinator", "hn.algolia"],
-                &["top_stories", "get_item", "search_cached_stories"],
-                &["https://github.com/HackerNews/API"],
-            ),
-        ),
-        worker_recipe(
-            "producthunt",
-            "marketing",
-            RecipeStage::ResearchFirst,
-            90,
-            (
-                "official GraphQL API with OAuth",
-                "Track launches, maker profiles, topic search, and launch momentum.",
-                "High demo value, but GraphQL auth and query shape should be researched before live handlers.",
-            ),
-            (
-                &["producthunt", "product hunt"],
-                &[
-                    "top_launches",
-                    "launch_details",
-                    "maker_lookup",
-                    "topic_search",
-                    "launch_metrics",
-                ],
-                &["https://www.producthunt.com/v2/docs"],
-            ),
-        ),
-        worker_recipe(
-            "linear",
-            "project_management",
-            RecipeStage::ResearchFirst,
-            88,
-            (
-                "official GraphQL API with API key or OAuth",
-                "Summarize blocked work, stale issues, cycle risk, issue search, and team load.",
-                "Strong agent use case, but schema, scopes, and workspace auth should be planned first.",
-            ),
-            (
-                &["linear", "linear.app"],
-                &[
-                    "blocked_issues",
-                    "stale_issues",
-                    "cycle_risk",
-                    "issue_search",
-                    "team_workload",
-                ],
-                &["https://linear.app/docs/api/"],
-            ),
-        ),
-        worker_recipe(
-            "github_repo",
-            "developer_tools",
-            RecipeStage::ResearchFirst,
-            86,
-            (
-                "GitHub API and local git metadata",
-                "Summarize repo health, stale PRs, open issues, releases, and failing checks.",
-                "Useful across nearly every project, but should be scoped around repo-risk jobs not full GitHub coverage.",
-            ),
-            (
-                &["github repo", "pull request", "github.com"],
-                &[
-                    "repo_summary",
-                    "stale_prs",
-                    "open_issues",
-                    "release_notes",
-                    "ci_failures",
-                ],
-                &["https://docs.github.com/en/rest"],
-            ),
-        ),
-        worker_recipe(
-            "stripe",
-            "payments",
-            RecipeStage::ResearchFirst,
-            78,
-            (
-                "official REST API with account-scoped keys",
-                "Inspect customer health, subscription risk, failed payments, invoices, and revenue snapshots.",
-                "High-value business workflows, but money movement and account permissions make this research-first.",
-            ),
-            (
-                &["stripe"],
-                &[
-                    "customer_summary",
-                    "subscription_risk",
-                    "failed_payments",
-                    "invoice_lookup",
-                    "revenue_snapshot",
-                ],
-                &["https://docs.stripe.com/api"],
-            ),
-        ),
-        worker_recipe(
-            "arxiv",
-            "research",
-            RecipeStage::BuildNow,
-            82,
-            (
-                "public Atom query API",
-                "Search papers, summarize findings, inspect author trends, and build citation packs.",
-                "Public read-only metadata with a natural cache/search worker shape.",
-            ),
-            (
-                &["arxiv", "arxiv.org"],
-                &[
-                    "search_papers",
-                    "paper_summary",
-                    "author_trends",
-                    "related_papers",
-                    "citation_pack",
-                ],
-                &["https://arxiv.org/help/api/user-manual"],
-            ),
-        ),
-        worker_recipe(
-            "wikipedia",
-            "knowledge",
-            RecipeStage::BuildNow,
-            80,
-            (
-                "public MediaWiki REST and action APIs",
-                "Summarize pages, search topics, read sections, cite sources, and compare pages.",
-                "Public knowledge source where narrow citation and compare functions are more useful than raw API access.",
-            ),
-            (
-                &["wikipedia", "wikimedia"],
-                &[
-                    "article_summary",
-                    "topic_search",
-                    "page_sections",
-                    "citations",
-                    "compare_pages",
-                ],
-                &["https://www.mediawiki.org/wiki/API:REST_API"],
-            ),
-        ),
-        worker_recipe(
-            "sentry",
-            "monitoring",
-            RecipeStage::ResearchFirst,
-            76,
-            (
-                "official REST API with org/project auth",
-                "Summarize production issues, release regressions, trends, suspect commits, and alerts.",
-                "Good operational value, but org scopes, rate limits, and alert semantics need validation.",
-            ),
-            (
-                &["sentry"],
-                &[
-                    "issue_summary",
-                    "release_regressions",
-                    "error_trends",
-                    "suspect_commits",
-                    "alert_digest",
-                ],
-                &["https://docs.sentry.io/api/"],
-            ),
-        ),
-        worker_recipe(
-            "slack",
-            "productivity",
-            RecipeStage::ResearchFirst,
-            72,
-            (
-                "Slack Web API with app tokens and scopes",
-                "Search channels, summarize threads, extract decisions, and prepare follow-ups.",
-                "Compelling agent memory workflows, but workspace scopes and data retention rules need deliberate design.",
-            ),
-            (
-                &["slack"],
-                &[
-                    "channel_search",
-                    "thread_summary",
-                    "decision_digest",
-                    "followups",
-                    "user_context",
-                ],
-                &["https://api.slack.com/web"],
-            ),
-        ),
-        worker_recipe(
-            "notion",
-            "productivity",
-            RecipeStage::ResearchFirst,
-            70,
-            (
-                "official REST API with integration permissions",
-                "Search workspace knowledge, summarize pages, inspect databases, and create update briefs.",
-                "Knowledge workflows are strong, but page/database capability gaps should be mapped before implementation.",
-            ),
-            (
-                &["notion"],
-                &[
-                    "workspace_search",
-                    "page_summary",
-                    "database_query",
-                    "decision_log",
-                    "update_brief",
-                ],
-                &["https://developers.notion.com/guides/get-started"],
-            ),
-        ),
-        worker_recipe(
-            "openrouter",
-            "ai",
-            RecipeStage::ResearchFirst,
-            68,
-            (
-                "OpenAI-compatible API with model registry",
-                "Compare model availability, pricing, capabilities, and routing fit.",
-                "Useful for model routing, but needs current model/pricing research and cache policy before live calls.",
-            ),
-            (
-                &["openrouter"],
-                &[
-                    "model_search",
-                    "model_compare",
-                    "pricing_lookup",
-                    "capability_filter",
-                    "routing_recommendation",
-                ],
-                &["https://openrouter.ai/docs/api-reference/overview/"],
-            ),
-        ),
-    ]
-}
-
-pub fn inspect_artifact(input: ArtifactInput) -> Result<InspectResult> {
-    let namespace = slugify(&input.name);
-    let source_type = input.source_type.clone().unwrap_or_default();
-    let functions = infer_functions(&input);
-    let reuse_plan = plan_reuse(&input, &functions);
-    let existing_workers_to_use = reuse_worker_names(&reuse_plan);
-    Ok(InspectResult {
-        name: input.name.clone(),
-        namespace: namespace.clone(),
-        source_type,
-        source: input.source.clone(),
-        suggested_functions: functions
-            .iter()
-            .map(|function| format!("{}::{}", namespace, slugify(function)))
-            .collect(),
-        recommendation:
-            "Generate a narrow iii worker around the specific job, not a generic full API wrapper."
-                .into(),
-        existing_workers_to_use,
-        reuse_plan,
-    })
-}
-
-pub fn plan_worker(input: ArtifactInput) -> Result<WorkerPlan> {
-    let namespace = slugify(&input.name);
-    let source_type = input.source_type.clone().unwrap_or_default();
-    let inferred_functions = infer_functions(&input);
-    let functions = inferred_functions
-        .iter()
-        .map(|function| plan_function(&namespace, function))
-        .collect::<Vec<_>>();
-    let reuse_plan = plan_reuse(&input, &inferred_functions);
-    let uses_workers = reuse_worker_names(&reuse_plan);
-
-    Ok(WorkerPlan {
-        worker_name: format!("{}-worker", namespace.replace('_', "-")),
-        namespace: namespace.clone(),
-        source_type,
-        source: input.source.clone(),
-        goal: input
-            .goal
-            .clone()
-            .unwrap_or_else(|| format!("Expose focused agent-operable functions for {}.", input.name)),
-        functions,
-        uses_workers,
-        reuse_plan,
-        notes: vec![
-            "Keep function count small and job-specific.".into(),
-            "Prefer read-only functions unless the worker explicitly syncs or mutates external state.".into(),
-            "Persist manifests and source fingerprints through iii-state.".into(),
-            "Run generated code checks inside iii-sandbox before publishing.".into(),
-        ],
-    })
-}
-
-pub fn artifact_manifest(input: ArtifactInput) -> Result<ArtifactManifestPreview> {
-    let plan = plan_worker(input)?;
-    Ok(ArtifactManifestPreview {
-        schema: "artifact-worker.manifest.preview.v1".into(),
-        worker_name: plan.worker_name,
-        namespace: plan.namespace,
-        functions: plan.functions,
-        uses_workers: plan.uses_workers,
-        reuse_plan: plan.reuse_plan,
-    })
-}
-
-pub fn convert_artifact(input: ConvertArtifactInput) -> Result<GeneratedWorker> {
-    generate_worker(input.into_artifact_input()?)
-}
-
-pub fn generate_worker(input: ArtifactInput) -> Result<GeneratedWorker> {
-    let plan = plan_worker(input.clone())?;
-    let output_dir = input
-        .output_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("generated").join(&plan.worker_name));
-    let src_dir = output_dir.join("src");
-    fs::create_dir_all(&src_dir)?;
-
-    let manifest_path = output_dir.join("artifact.manifest.json");
-    let worker_path = src_dir.join("main.rs");
-
-    fs::write(&manifest_path, serde_json::to_string_pretty(&plan)? + "\n")?;
-    fs::write(&worker_path, render_worker_source(&plan))?;
-    fs::write(output_dir.join("Cargo.toml"), render_worker_cargo(&plan))?;
-    fs::write(output_dir.join("README.md"), render_worker_readme(&plan))?;
-    fs::write(
-        output_dir.join("iii.worker.yaml"),
-        render_worker_yaml(&plan),
-    )?;
-
-    Ok(GeneratedWorker {
-        output_dir,
-        worker_path,
-        manifest_path,
-        plan,
-    })
-}
-
 impl ConvertArtifactInput {
-    fn into_artifact_input(self) -> Result<ArtifactInput> {
+    fn into_artifact_source(self) -> Result<ArtifactSource> {
+        let command = match self.command {
+            Some(command) => {
+                let command = command.trim().to_string();
+                if command.is_empty() {
+                    return Err(ArtifactError::InvalidInput(
+                        "command cannot be blank for MCP stdio conversion".into(),
+                    ));
+                }
+                Some(command)
+            }
+            None => None,
+        };
         let source = match self.source {
             Some(source) => {
                 let source = source.trim().to_string();
@@ -676,9 +264,15 @@ impl ConvertArtifactInput {
                 Some(source)
             }
             None => None,
-        };
+        }
+        .or_else(|| {
+            command
+                .as_ref()
+                .map(|command| mcp_stdio_source_label(command, &self.args))
+        });
+
         let name = match (self.name, source.as_deref()) {
-            (Some(name), _) if !name.trim().is_empty() => name,
+            (Some(name), _) if !name.trim().is_empty() => name.trim().to_string(),
             (_, Some(source)) => infer_name_from_source(source),
             _ => {
                 return Err(ArtifactError::InvalidInput(
@@ -686,583 +280,1269 @@ impl ConvertArtifactInput {
                 ));
             }
         };
+        let namespace = slugify(&name);
         let source_type = self
             .source_type
+            .or_else(|| command.as_ref().map(|_| SourceType::Mcp))
             .or_else(|| source.as_deref().map(infer_source_type_from_source))
             .unwrap_or_default();
 
-        Ok(ArtifactInput {
-            name,
-            goal: self.goal,
-            source_type: Some(source_type),
+        Ok(ArtifactSource {
+            worker_name: format!("{}-worker", namespace.replace('_', "-")),
+            namespace,
+            source_type,
             source,
+            command,
+            args: self.args,
+            env: self.env,
             functions: self.functions,
-            output_dir: self.output_dir,
         })
     }
 }
 
-pub fn verify_worker(input: VerifyWorkerInput) -> Result<VerificationReport> {
-    verify_worker_dir(input.output_dir)
+fn register_openapi_virtual_worker(
+    iii: &iii_sdk::III,
+    artifact: ArtifactSource,
+) -> Result<ArtifactConversion> {
+    let source = artifact.source.as_deref().ok_or_else(|| {
+        ArtifactError::InvalidInput("OpenAPI conversion requires url/source".into())
+    })?;
+    let spec_text = fetch_text_for_conversion(source)?;
+    let spec = parse_openapi_spec(&spec_text)?;
+    let virtual_functions = openapi_virtual_functions(&artifact, source, &spec)?;
+    register_virtual_worker(iii, &artifact, virtual_functions, "http_invocation")
 }
 
-pub fn install_plan(output_dir: impl AsRef<Path>) -> Result<WorkerInstallPlan> {
-    let output_dir = output_dir.as_ref();
-    let verification = verify_worker_dir(output_dir)?;
-    let manifest_path = output_dir.join("artifact.manifest.json");
-    let plan = if manifest_path.exists() {
-        serde_json::from_str::<WorkerPlan>(&fs::read_to_string(&manifest_path)?)?
+fn register_mcp_virtual_worker(
+    iii: &iii_sdk::III,
+    artifact: ArtifactSource,
+) -> Result<ArtifactConversion> {
+    let transport = mcp_transport_from_artifact(&artifact)?;
+    let virtual_functions = if artifact.functions.is_empty() {
+        mcp_discovered_virtual_functions(&artifact, &transport)?
     } else {
-        WorkerPlan {
-            worker_name: "unknown-worker".into(),
-            namespace: "unknown".into(),
-            source_type: SourceType::Manual,
-            source: None,
-            goal: "Unknown generated worker.".into(),
-            functions: Vec::new(),
-            uses_workers: Vec::new(),
-            reuse_plan: ReusePlan::default(),
-            notes: Vec::new(),
-        }
+        mcp_named_virtual_functions(&artifact, &transport)
     };
-    let mut commands = plan
-        .reuse_plan
-        .installable_workers
-        .iter()
-        .filter_map(|worker| worker.install.clone())
-        .collect::<Vec<_>>();
-    commands.push(format!(
-        "cd {} && cargo build --release",
-        output_dir.display()
-    ));
-    commands.push(format!(
-        "III_URL=ws://localhost:49134 {}/target/release/{}",
-        output_dir.display(),
-        plan.worker_name
-    ));
-
-    Ok(WorkerInstallPlan {
-        ok: verification.ok,
-        worker_name: plan.worker_name,
-        worker_dir: output_dir.to_path_buf(),
-        dependencies: plan.reuse_plan.installable_workers,
-        commands,
-        verification,
-    })
+    register_virtual_worker(iii, &artifact, virtual_functions, "http_invocation")
 }
 
-pub fn verify_worker_dir(output_dir: impl AsRef<Path>) -> Result<VerificationReport> {
-    let output_dir = output_dir.as_ref();
-    let manifest_path = output_dir.join("artifact.manifest.json");
-    let worker_path = output_dir.join("src/main.rs");
-    let required_files = [
-        manifest_path.clone(),
-        worker_path.clone(),
-        output_dir.join("Cargo.toml"),
-        output_dir.join("README.md"),
-        output_dir.join("iii.worker.yaml"),
-    ];
-    let missing_files = required_files
-        .iter()
-        .filter(|path| !path.exists())
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>();
+fn register_virtual_worker(
+    iii: &iii_sdk::III,
+    artifact: &ArtifactSource,
+    virtual_functions: Vec<VirtualHttpFunction>,
+    mode: &str,
+) -> Result<ArtifactConversion> {
+    let mut registered_functions = Vec::new();
+    for function in virtual_functions {
+        let method_label = http_method_label(&function.method).to_string();
+        let invocation_url = register_bridge_function(&function)?;
+        let message = RegisterFunctionMessage {
+            id: function.function_id.clone(),
+            description: Some(function.description.clone()),
+            request_format: function.request_format.clone(),
+            response_format: function.response_format.clone(),
+            metadata: Some(function.metadata.clone()),
+            invocation: None,
+        };
+        let mut refs = generated_function_refs().lock().map_err(|_| {
+            ArtifactError::InvalidInput("generated function registry lock poisoned".into())
+        })?;
+        if let Some(existing) = refs.remove(&function.function_id) {
+            existing.unregister();
+        }
+        let function_ref = iii.register_function_with(
+            message,
+            HttpInvocationConfig {
+                url: invocation_url,
+                method: HttpMethod::Post,
+                timeout_ms: Some(30_000),
+                headers: HashMap::new(),
+                auth: None,
+            },
+        );
+        refs.insert(function.function_id.clone(), function_ref);
+        drop(refs);
 
-    if !missing_files.is_empty() {
-        return Ok(VerificationReport {
-            ok: false,
-            worker_path,
-            function_count: 0,
-            missing_registrations: Vec::new(),
-            missing_files,
+        registered_functions.push(VirtualFunctionRegistration {
+            function_id: function.function_id,
+            url: function.url,
+            method: method_label,
+            description: function.description,
         });
     }
 
-    let plan: WorkerPlan = serde_json::from_str(&fs::read_to_string(&manifest_path)?)?;
-    let worker_source = fs::read_to_string(&worker_path)?;
-    let missing_registrations = plan
-        .functions
-        .iter()
-        .filter_map(|function| {
-            let has_id = worker_source.contains(&function.function_id);
-            let has_iii_registration = worker_source.contains("iii.register_function");
-            if has_id && has_iii_registration {
-                None
-            } else {
-                Some(function.function_id.clone())
-            }
-        })
-        .collect::<Vec<_>>();
+    let manifest = VirtualWorkerManifest {
+        schema: "artifact-worker.http-invocation.v1".into(),
+        worker_name: artifact.worker_name.clone(),
+        namespace: artifact.namespace.clone(),
+        source_type: artifact.source_type.clone(),
+        source: artifact.source.clone(),
+        functions: registered_functions.clone(),
+    };
 
-    Ok(VerificationReport {
-        ok: missing_registrations.is_empty(),
-        worker_path,
-        function_count: plan.functions.len(),
-        missing_registrations,
-        missing_files,
+    Ok(ArtifactConversion {
+        ok: true,
+        mode: mode.into(),
+        worker_name: artifact.worker_name.clone(),
+        namespace: artifact.namespace.clone(),
+        source_type: artifact.source_type.clone(),
+        source: artifact.source.clone(),
+        function_count: registered_functions.len(),
+        registered_functions,
+        manifest,
+        notes: vec![
+            "Registered functions are normal iii functions backed by engine HTTP invocation."
+                .into(),
+        ],
     })
 }
 
-fn engine_builtin_catalog() -> Vec<ReusableWorker> {
-    vec![
-        reusable_worker(
-            "iii-state",
-            "iii-hq/iii",
-            None,
-            "Persist manifests, source fingerprints, cache metadata, and generated worker state.",
-            &["state", "cache", "manifest", "fingerprint"],
-            &[
-                "state::get",
-                "state::set",
-                "state::delete",
-                "state::list",
-                "state::update",
-            ],
-        ),
-        reusable_worker(
-            "iii-queue",
-            "iii-hq/iii",
-            None,
-            "Run generation, verification, sync, and publish jobs asynchronously with retries.",
-            &[
-                "queue",
-                "async",
-                "retry",
-                "dlq",
-                "generation",
-                "verification",
-            ],
-            &["queue trigger", "durable subscriber"],
-        ),
-        reusable_worker(
-            "iii-cron",
-            "iii-hq/iii",
-            None,
-            "Refresh synced artifacts and local mirrors on schedules.",
-            &["cron", "schedule", "refresh"],
-            &["cron trigger"],
-        ),
-        reusable_worker(
-            "iii-rest",
-            "iii-hq/iii",
-            None,
-            "Expose generated worker functions as HTTP endpoints when needed.",
-            &["http", "api", "endpoint", "rest"],
-            &["http trigger"],
-        ),
-        reusable_worker(
-            "iii-stream",
-            "iii-hq/iii",
-            None,
-            "Stream long-running generation progress, sync results, and runtime events.",
-            &["stream", "realtime", "events"],
-            &["stream::get", "stream::set"],
-        ),
-        reusable_worker(
-            "iii-sandbox",
-            "iii-hq/iii",
-            None,
-            "Build, test, and execute generated code in an isolated engine sandbox.",
-            &["sandbox", "build", "test", "verification", "shell"],
-            &["sandbox::exec"],
-        ),
-        reusable_worker(
-            "iii-observability",
-            "iii-hq/iii",
-            None,
-            "Record traces, logs, rollups, and debug telemetry for generation and runtime calls.",
-            &["observability", "trace", "log", "metric", "debug"],
-            &[
-                "engine::traces::list",
-                "engine::traces::tree",
-                "engine::alerts::*",
-            ],
-        ),
-    ]
-}
-
-fn installable_worker_catalog() -> Vec<ReusableWorker> {
-    vec![
-        reusable_worker(
-            "auth-credentials",
-            "iii-hq/workers",
-            Some("iii worker add auth-credentials"),
-            "Store API keys and OAuth tokens for generated workers.",
-            &["credentials", "auth", "oauth"],
-            &["auth::set", "auth::get", "auth::list", "auth::clear", "auth::resolve"],
-        ),
-        reusable_worker(
-            "shell-bash",
-            "iii-hq/workers",
-            Some("iii worker add shell-bash"),
-            "Run sandboxed CLI, git, build, and smoke-test commands through the iii bus.",
-            &["shell", "cli", "git", "build", "test", "verification"],
-            &["shell::bash::exec", "shell::bash::which", "shell::bash::detect_clis"],
-        ),
-        reusable_worker(
-            "shell-filesystem",
-            "iii-hq/workers",
-            Some("iii worker add shell-filesystem"),
-            "Read, write, list, grep, and edit files for artifact ingestion and generated output.",
-            &["filesystem", "docs", "source", "file", "grep"],
-            &[
-                "shell::filesystem::read",
-                "shell::filesystem::write",
-                "shell::filesystem::ls",
-                "shell::filesystem::grep",
-                "shell::filesystem::edit",
-            ],
-        ),
-        reusable_worker(
-            "iii-database",
-            "iii-hq/workers",
-            Some("iii worker add iii-database"),
-            "Back generated workers with SQLite, Postgres, MySQL, query polling, and local mirrors.",
-            &["database", "sqlite", "postgres", "mysql", "cache", "search", "sync"],
-            &[
-                "iii-database::query",
-                "iii-database::execute",
-                "iii-database::prepareStatement",
-                "iii-database::runStatement",
-                "iii-database::transaction",
-            ],
-        ),
-        reusable_worker(
-            "mcp",
-            "iii-hq/workers",
-            Some("iii worker add mcp"),
-            "Expose selected iii functions as MCP tools for IDE and agent clients.",
-            &["mcp", "tool", "agent", "ide", "publish"],
-            &["mcp::handler"],
-        ),
-        reusable_worker(
-            "skills",
-            "iii-hq/workers",
-            Some("iii worker add skills"),
-            "Publish generated worker usage notes as resources, slash commands, and MCP prompts.",
-            &["skills", "docs", "agent", "mcp", "publish"],
-            &["skills::resources-list", "skills::resources-read", "prompts::mcp-list"],
-        ),
-        reusable_worker(
-            "proof",
-            "iii-hq/workers",
-            Some("iii worker add proof"),
-            "Verify web-facing generated workers with browser automation and replayable flows.",
-            &["browser", "ui", "playwright", "test", "verification"],
-            &[
-                "proof::scan",
-                "proof::browser::launch",
-                "proof::browser::navigate",
-                "proof::browser::snapshot",
-                "proof::browser::click",
-                "proof::report",
-            ],
-        ),
-        reusable_worker(
-            "provider-router",
-            "iii-hq/workers",
-            Some("iii worker add provider-router"),
-            "Route assistant calls through installed model providers and session controls.",
-            &["llm", "assistant", "provider", "router"],
-            &[
-                "router::stream_assistant",
-                "router::abort",
-                "router::push_steering",
-                "router::push_followup",
-            ],
-        ),
-        reusable_worker(
-            "models-catalog",
-            "iii-hq/workers",
-            Some("iii worker add models-catalog"),
-            "Query model capabilities when a generated worker needs model selection.",
-            &["llm", "model", "capability", "provider"],
-            &["models::list", "models::get", "models::supports", "models::register"],
-        ),
-        reusable_worker(
-            "provider-openai",
-            "iii-hq/workers",
-            Some("iii worker add provider-openai"),
-            "Call OpenAI model APIs as an iii provider.",
-            &["llm", "model", "provider", "openai"],
-            &["provider::openai::complete"],
-        ),
-        reusable_worker(
-            "provider-anthropic",
-            "iii-hq/workers",
-            Some("iii worker add provider-anthropic"),
-            "Call Anthropic Messages API as an iii provider.",
-            &["llm", "model", "provider", "anthropic"],
-            &["provider::anthropic::complete"],
-        ),
-        reusable_worker(
-            "hook-fanout",
-            "iii-hq/workers",
-            Some("iii worker add hook-fanout"),
-            "Publish events to subscribers and merge replies for extensible generated workflows.",
-            &["hooks", "events", "fanout", "extension"],
-            &["hooks::publish_collect"],
-        ),
-        reusable_worker(
-            "session-tree",
-            "iii-hq/workers",
-            Some("iii worker add session-tree"),
-            "Store agent sessions as typed parent-id trees when generated workers manage conversations.",
-            &["session", "conversation", "tree"],
-            &["session::*"],
-        ),
-        reusable_worker(
-            "session-inbox",
-            "iii-hq/workers",
-            Some("iii worker add session-inbox"),
-            "Buffer per-session steering and follow-up messages.",
-            &["session", "inbox"],
-            &["inbox::push", "inbox::drain", "inbox::peek"],
-        ),
-        reusable_worker(
-            "policy-denylist",
-            "iii-hq/workers",
-            Some("iii worker add policy-denylist"),
-            "Block unsafe tool calls before generated workers invoke external tools.",
-            &["policy", "security", "guard"],
-            &["policy::denylist::check"],
-        ),
-    ]
-}
-
-fn reusable_worker(
-    name: &str,
+fn openapi_virtual_functions(
+    artifact: &ArtifactSource,
     source: &str,
-    install: Option<&str>,
-    purpose: &str,
-    capabilities: &[&str],
-    functions: &[&str],
-) -> ReusableWorker {
-    ReusableWorker {
-        name: name.into(),
-        source: source.into(),
-        install: install.map(str::to_string),
-        purpose: purpose.into(),
-        capabilities: capabilities.iter().map(|value| (*value).into()).collect(),
-        functions: functions.iter().map(|value| (*value).into()).collect(),
+    spec: &Value,
+) -> Result<Vec<VirtualHttpFunction>> {
+    let paths = spec
+        .get("paths")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ArtifactError::InvalidInput("OpenAPI spec is missing paths".into()))?;
+    let base_url = openapi_base_url(spec, source)?;
+    let mut seen = HashSet::new();
+    let mut operations = Vec::new();
+    let mut path_entries = paths.iter().collect::<Vec<_>>();
+    path_entries.sort_by_key(|(path, _)| *path);
+
+    for (path, path_item) in path_entries {
+        let Some(path_item) = path_item.as_object() else {
+            continue;
+        };
+        let path_parameters = path_item
+            .get("parameters")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut method_entries = path_item.iter().collect::<Vec<_>>();
+        method_entries.sort_by_key(|(method, _)| *method);
+        for (method, operation) in method_entries {
+            let Some(http_method) = openapi_http_method(method) else {
+                continue;
+            };
+            let Some(operation) = operation.as_object() else {
+                continue;
+            };
+            let function_id = unique_function_id(
+                &artifact.namespace,
+                operation
+                    .get("operationId")
+                    .and_then(Value::as_str)
+                    .map(slugify)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| slugify(&format!("{method}_{path}"))),
+                &mut seen,
+            );
+            let description = operation
+                .get("summary")
+                .or_else(|| operation.get("description"))
+                .and_then(Value::as_str)
+                .unwrap_or("OpenAPI HTTP-invoked function")
+                .to_string();
+            let parameters = openapi_parameters(&path_parameters, operation);
+            operations.push(VirtualHttpFunction {
+                function_id,
+                url: join_url_path(&base_url, path),
+                method: http_method,
+                mcp_transport: None,
+                invocation: VirtualInvocation::Http,
+                description,
+                request_format: Some(openapi_request_format(&parameters, operation)),
+                response_format: openapi_response_format(operation),
+                metadata: artifact_metadata(
+                    artifact,
+                    serde_json::json!({
+                        "path": path,
+                        "method": method.to_uppercase()
+                    }),
+                ),
+            });
+        }
     }
+
+    if operations.is_empty() {
+        return Err(ArtifactError::InvalidInput(
+            "OpenAPI spec did not expose any HTTP operations".into(),
+        ));
+    }
+    Ok(operations)
 }
 
-fn worker_recipe(
-    name: &str,
-    category: &str,
-    stage: RecipeStage,
-    priority: u8,
-    details: WorkerRecipeDetails<'_>,
-    sources: WorkerRecipeSources<'_>,
-) -> WorkerRecipe {
-    let (integration, goal, rationale) = details;
-    let (source_hints, default_functions, research_links) = sources;
-    WorkerRecipe {
-        name: name.into(),
-        category: category.into(),
-        stage,
-        priority,
-        integration: integration.into(),
-        goal: goal.into(),
-        source_hints: source_hints.iter().map(|value| (*value).into()).collect(),
-        default_functions: default_functions
-            .iter()
-            .map(|value| (*value).into())
-            .collect(),
-        research_links: research_links.iter().map(|value| (*value).into()).collect(),
-        rationale: rationale.into(),
+fn mcp_discovered_virtual_functions(
+    artifact: &ArtifactSource,
+    transport: &McpTransport,
+) -> Result<Vec<VirtualHttpFunction>> {
+    let source = transport.source_label();
+    let tools = mcp_list_tools(transport)?;
+    if tools.is_empty() {
+        return Err(ArtifactError::InvalidInput(
+            "MCP server did not expose any tools".into(),
+        ));
     }
-}
 
-fn plan_reuse(input: &ArtifactInput, functions: &[String]) -> ReusePlan {
-    let capabilities = infer_capabilities(input, functions);
-    let engine_builtins = engine_builtin_catalog()
+    let mut seen = HashSet::new();
+    Ok(tools
         .into_iter()
-        .filter(|worker| worker_matches(worker, &capabilities))
-        .collect::<Vec<_>>();
-    let installable_workers = installable_worker_catalog()
-        .into_iter()
-        .filter(|worker| worker_matches(worker, &capabilities))
-        .collect::<Vec<_>>();
-    let mut covered = Vec::new();
-    for worker in engine_builtins.iter().chain(installable_workers.iter()) {
-        for capability in &worker.capabilities {
-            push_unique(&mut covered, capability);
-        }
-    }
-    let missing_capabilities = capabilities
-        .into_iter()
-        .filter(|capability| !covered.iter().any(|covered| covered == capability))
-        .collect();
-
-    ReusePlan {
-        engine_builtins,
-        installable_workers,
-        missing_capabilities,
-    }
+        .map(|tool| {
+            let function_id =
+                unique_function_id(&artifact.namespace, slugify(&tool.name), &mut seen);
+            let description = tool
+                .description
+                .clone()
+                .or_else(|| tool.title.clone())
+                .unwrap_or_else(|| format!("Call MCP tool {}.", tool.name));
+            VirtualHttpFunction {
+                function_id,
+                url: source.clone(),
+                method: HttpMethod::Post,
+                mcp_transport: Some(transport.clone()),
+                invocation: VirtualInvocation::McpTool {
+                    tool_name: tool.name.clone(),
+                },
+                description,
+                request_format: Some(tool.input_schema),
+                response_format: tool.output_schema,
+                metadata: artifact_metadata(artifact, serde_json::json!({ "mcpTool": tool.name })),
+            }
+        })
+        .collect())
 }
 
-fn infer_capabilities(input: &ArtifactInput, functions: &[String]) -> Vec<String> {
-    let mut capabilities = Vec::new();
-    push_unique(&mut capabilities, "state");
-    push_unique(&mut capabilities, "observability");
-    push_unique(&mut capabilities, "sandbox");
-
-    let source_type = input.source_type.clone().unwrap_or_default();
-    let haystack = format!(
-        "{} {} {} {}",
-        input.name,
-        input.goal.as_deref().unwrap_or_default(),
-        input.source.as_deref().unwrap_or_default(),
-        functions.join(" ")
-    )
-    .to_lowercase();
-
-    let public_digg = contains_any(
-        &haystack,
-        &[
-            "digg",
-            "di.gg",
-            "ai 1000",
-            "leaderboard",
-            "pipeline status",
-            "top stories",
-        ],
-    );
-
-    match source_type {
-        SourceType::OpenApi | SourceType::Graphql | SourceType::Har | SourceType::Url => {
-            push_unique(&mut capabilities, "http");
-        }
-        SourceType::Mcp => {
-            push_unique(&mut capabilities, "mcp");
-            push_unique(&mut capabilities, "http");
-        }
-        SourceType::Docs | SourceType::Manual => {
-            push_unique(&mut capabilities, "docs");
-            push_unique(&mut capabilities, "filesystem");
-        }
-    }
-
-    if contains_any(
-        &haystack,
-        &[
-            "search", "cache", "cached", "sync", "mirror", "history", "sqlite", "postgres",
-            "mysql", "sql",
-        ],
-    ) {
-        push_unique(&mut capabilities, "database");
-    }
-    if contains_any(
-        &haystack,
-        &[
-            "sync",
-            "refresh",
-            "generate",
-            "verify",
-            "background",
-            "queue",
-            "retry",
-        ],
-    ) {
-        push_unique(&mut capabilities, "queue");
-    }
-    if contains_any(
-        &haystack,
-        &[
-            "cron",
-            "schedule",
-            "scheduled",
-            "daily",
-            "hourly",
-            "refresh",
-        ],
-    ) {
-        push_unique(&mut capabilities, "cron");
-    }
-    if contains_any(
-        &haystack,
-        &["mcp", "tool", "agent", "codex", "claude", "ide", "publish"],
-    ) {
-        push_unique(&mut capabilities, "mcp");
-    }
-    if contains_any(
-        &haystack,
-        &["llm", "model", "assistant", "prompt", "completion"],
-    ) {
-        push_unique(&mut capabilities, "llm");
-    }
-    if contains_any(
-        &haystack,
-        &["browser", "ui", "playwright", "web app", "screenshot"],
-    ) {
-        push_unique(&mut capabilities, "browser");
-        push_unique(&mut capabilities, "test");
-    }
-    if contains_any(
-        &haystack,
-        &["shell", "cli", "build", "cargo", "npm", "pnpm", "test"],
-    ) {
-        push_unique(&mut capabilities, "shell");
-    }
-    if contains_any(&haystack, &["event", "hook", "fanout", "subscriber"]) {
-        push_unique(&mut capabilities, "events");
-    }
-    if contains_any(
-        &haystack,
-        &["policy", "security", "deny", "guard", "unsafe"],
-    ) {
-        push_unique(&mut capabilities, "policy");
-    }
-    if !public_digg
-        && contains_any(
-            &haystack,
-            &[
-                "oauth",
-                "token",
-                "api key",
-                "credential",
-                "github",
-                "linear",
-                "jira",
-            ],
-        )
-    {
-        push_unique(&mut capabilities, "credentials");
-    }
-    if public_digg {
-        push_unique(&mut capabilities, "http");
-        push_unique(&mut capabilities, "database");
-    }
-
-    capabilities
-}
-
-fn worker_matches(worker: &ReusableWorker, capabilities: &[String]) -> bool {
-    worker
-        .capabilities
+fn mcp_named_virtual_functions(
+    artifact: &ArtifactSource,
+    transport: &McpTransport,
+) -> Vec<VirtualHttpFunction> {
+    let source = transport.source_label();
+    let mut seen = HashSet::new();
+    artifact
+        .functions
         .iter()
-        .any(|capability| capabilities.iter().any(|needed| needed == capability))
-}
-
-fn reuse_worker_names(reuse_plan: &ReusePlan) -> Vec<String> {
-    reuse_plan
-        .engine_builtins
-        .iter()
-        .chain(reuse_plan.installable_workers.iter())
-        .map(|worker| worker.name.clone())
+        .map(|function| {
+            let local_name = function_local_name(function, &artifact.namespace);
+            let local_slug = slugify(&local_name);
+            let invocation = match local_slug.as_str() {
+                "tools_list" => VirtualInvocation::McpToolsList,
+                "tool_call" => VirtualInvocation::McpToolCall,
+                _ => VirtualInvocation::McpTool {
+                    tool_name: local_name.clone(),
+                },
+            };
+            let metadata = match &invocation {
+                VirtualInvocation::McpTool { tool_name } => {
+                    artifact_metadata(artifact, serde_json::json!({ "mcpTool": tool_name }))
+                }
+                VirtualInvocation::McpToolsList | VirtualInvocation::McpToolCall => {
+                    artifact_metadata(artifact, serde_json::json!({}))
+                }
+                VirtualInvocation::Http => artifact_metadata(artifact, serde_json::json!({})),
+            };
+            VirtualHttpFunction {
+                function_id: unique_function_id(&artifact.namespace, local_slug, &mut seen),
+                url: source.clone(),
+                method: HttpMethod::Post,
+                mcp_transport: Some(transport.clone()),
+                invocation,
+                description: format!("Call MCP tool {local_name}."),
+                request_format: Some(empty_object_schema()),
+                response_format: None,
+                metadata,
+            }
+        })
         .collect()
 }
 
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
+fn artifact_metadata(artifact: &ArtifactSource, extra: Value) -> Value {
+    let mut artifact_meta = serde_json::Map::new();
+    artifact_meta.insert("mode".into(), Value::String("http_invocation".into()));
+    artifact_meta.insert(
+        "sourceType".into(),
+        Value::String(source_type_label(&artifact.source_type).into()),
+    );
+    if let Some(source) = &artifact.source {
+        artifact_meta.insert("source".into(), Value::String(source.clone()));
+    }
+    artifact_meta.insert(
+        "workerName".into(),
+        Value::String(artifact.worker_name.clone()),
+    );
+    artifact_meta.insert(
+        "namespace".into(),
+        Value::String(artifact.namespace.clone()),
+    );
+    if let Value::Object(extra) = extra {
+        for (key, value) in extra {
+            artifact_meta.insert(key, value);
+        }
+    }
+    serde_json::json!({
+        "artifact": artifact_meta,
+        "iii": {
+            "virtualWorker": { "name": artifact.worker_name }
+        }
+    })
+}
+
+fn source_type_label(source_type: &SourceType) -> &'static str {
+    match source_type {
+        SourceType::OpenApi => "openapi",
+        SourceType::Graphql => "graphql",
+        SourceType::Har => "har",
+        SourceType::Mcp => "mcp",
+        SourceType::Docs => "docs",
+        SourceType::Url => "url",
+        SourceType::Manual => "manual",
+    }
+}
+
+impl McpTransport {
+    fn source_label(&self) -> String {
+        match self {
+            McpTransport::Http(url) => url.clone(),
+            McpTransport::Stdio(config) => mcp_stdio_source_label(&config.command, &config.args),
+        }
+    }
+}
+
+fn mcp_transport_from_artifact(artifact: &ArtifactSource) -> Result<McpTransport> {
+    if let Some(command) = artifact
+        .command
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(McpTransport::Stdio(McpStdioConfig {
+            command: command.to_string(),
+            args: artifact.args.clone(),
+            env: artifact.env.clone(),
+        }));
+    }
+    let source = artifact.source.as_deref().ok_or_else(|| {
+        ArtifactError::InvalidInput("MCP conversion requires url/source or command".into())
+    })?;
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return Ok(McpTransport::Http(source.to_string()));
+    }
+    if let Some(command_line) = source.strip_prefix("stdio:") {
+        return mcp_stdio_transport_from_source(command_line);
+    }
+    Err(ArtifactError::InvalidInput(
+        "MCP conversion requires an HTTP endpoint or stdio command".into(),
+    ))
+}
+
+fn mcp_stdio_transport_from_source(command_line: &str) -> Result<McpTransport> {
+    let parts = command_line
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let Some(command) = parts.first().filter(|value| !value.is_empty()) else {
+        return Err(ArtifactError::InvalidInput(
+            "stdio MCP source requires a command".into(),
+        ));
+    };
+    Ok(McpTransport::Stdio(McpStdioConfig {
+        command: command.clone(),
+        args: parts.iter().skip(1).cloned().collect(),
+        env: HashMap::new(),
+    }))
+}
+
+fn mcp_stdio_source_label(command: &str, args: &[String]) -> String {
+    let mut parts = vec![command.to_string()];
+    parts.extend(args.iter().cloned());
+    format!("stdio:{}", parts.join(" "))
+}
+
+fn mcp_list_tools(transport: &McpTransport) -> Result<Vec<McpToolSpec>> {
+    if let McpTransport::Stdio(config) = transport {
+        let result = mcp_stdio_json_rpc(config, "tools/list", None)?;
+        return serde_json::from_value::<McpListToolsResult>(result)
+            .map(|result| result.tools)
+            .map_err(|error| {
+                ArtifactError::InvalidInput(format!("invalid MCP tools/list: {error}"))
+            });
+    }
+    let session_id = mcp_initialize(transport)?;
+    mcp_send_initialized_notification(transport, session_id.as_deref())?;
+    let result = mcp_json_rpc(transport, "tools/list", None, session_id.as_deref())?;
+    serde_json::from_value::<McpListToolsResult>(result)
+        .map(|result| result.tools)
+        .map_err(|error| ArtifactError::InvalidInput(format!("invalid MCP tools/list: {error}")))
+}
+
+fn mcp_tool_call(transport: &McpTransport, tool_name: &str, arguments: Value) -> Result<Value> {
+    if let McpTransport::Stdio(config) = transport {
+        return mcp_stdio_json_rpc(
+            config,
+            "tools/call",
+            Some(serde_json::json!({
+                "name": tool_name,
+                "arguments": arguments
+            })),
+        );
+    }
+    let session_id = mcp_initialize(transport)?;
+    mcp_send_initialized_notification(transport, session_id.as_deref())?;
+    mcp_json_rpc(
+        transport,
+        "tools/call",
+        Some(serde_json::json!({
+            "name": tool_name,
+            "arguments": arguments
+        })),
+        session_id.as_deref(),
+    )
+}
+
+fn mcp_initialize(transport: &McpTransport) -> Result<Option<String>> {
+    let params = serde_json::json!({
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {
+            "name": "artifact-worker",
+            "version": env!("CARGO_PKG_VERSION")
+        }
+    });
+    let (_, session_id) = mcp_json_rpc_with_session(transport, "initialize", Some(params), None)?;
+    Ok(session_id)
+}
+
+fn mcp_send_initialized_notification(
+    transport: &McpTransport,
+    session_id: Option<&str>,
+) -> Result<()> {
+    let notification = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+    });
+    let (status, text, _) = send_mcp_message(transport, &notification, session_id)?;
+    if status >= 400 {
+        return Err(ArtifactError::InvalidInput(format!(
+            "MCP notifications/initialized HTTP {status}: {text}"
+        )));
+    }
+    Ok(())
+}
+
+fn mcp_json_rpc(
+    transport: &McpTransport,
+    method: &str,
+    params: Option<Value>,
+    session_id: Option<&str>,
+) -> Result<Value> {
+    mcp_json_rpc_with_session(transport, method, params, session_id).map(|(value, _)| value)
+}
+
+fn mcp_json_rpc_with_session(
+    transport: &McpTransport,
+    method: &str,
+    params: Option<Value>,
+    session_id: Option<&str>,
+) -> Result<(Value, Option<String>)> {
+    let mut request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method
+    });
+    if let Some(params) = params {
+        request["params"] = params;
+    }
+
+    let (status, text, next_session_id) = send_mcp_message(transport, &request, session_id)?;
+    if status >= 400 {
+        return Err(ArtifactError::InvalidInput(format!(
+            "MCP {method} HTTP {status}: {text}"
+        )));
+    }
+    let value = parse_mcp_http_body(&text)?;
+    if let Some(error) = value.get("error") {
+        return Err(ArtifactError::InvalidInput(format!(
+            "MCP {method} error: {error}"
+        )));
+    }
+    Ok((
+        value.get("result").cloned().unwrap_or(value),
+        next_session_id,
+    ))
+}
+
+fn send_mcp_message(
+    transport: &McpTransport,
+    body: &Value,
+    session_id: Option<&str>,
+) -> Result<(u16, String, Option<String>)> {
+    match transport {
+        McpTransport::Http(url) => send_mcp_http(url, body, session_id),
+        McpTransport::Stdio(_) => Err(ArtifactError::InvalidInput(
+            "stdio MCP uses a per-call session and cannot send standalone messages".into(),
+        )),
+    }
+}
+
+fn send_mcp_http(
+    url: &str,
+    body: &Value,
+    session_id: Option<&str>,
+) -> Result<(u16, String, Option<String>)> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
+    let body_text = serde_json::to_string(body)?;
+    let mut request = agent
+        .post(url)
+        .set("User-Agent", "artifact-worker/0.1")
+        .set("Content-Type", "application/json")
+        .set("Accept", "application/json, text/event-stream");
+    if let Some(session_id) = session_id {
+        request = request.set("Mcp-Session-Id", session_id);
+    }
+
+    match request.send_string(&body_text) {
+        Ok(response) => {
+            let status = response.status();
+            let session_id = response.header("Mcp-Session-Id").map(str::to_string);
+            let text = response
+                .into_string()
+                .map_err(|error| ArtifactError::InvalidInput(error.to_string()))?;
+            Ok((status, text, session_id))
+        }
+        Err(ureq::Error::Status(status, response)) => {
+            let session_id = response.header("Mcp-Session-Id").map(str::to_string);
+            let text = response.into_string().unwrap_or_default();
+            Ok((status, text, session_id))
+        }
+        Err(error) => Err(ArtifactError::InvalidInput(error.to_string())),
+    }
+}
+
+fn mcp_stdio_json_rpc(
+    config: &McpStdioConfig,
+    method: &str,
+    params: Option<Value>,
+) -> Result<Value> {
+    let mut child = Command::new(&config.command)
+        .args(&config.args)
+        .envs(&config.env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            ArtifactError::InvalidInput(format!(
+                "failed to start MCP stdio command '{}': {error}",
+                config.command
+            ))
+        })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| ArtifactError::InvalidInput("MCP stdio stdin unavailable".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ArtifactError::InvalidInput("MCP stdio stdout unavailable".into()))?;
+    let mut stdout = BufReader::new(stdout);
+
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "artifact-worker",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        }
+    });
+    write_mcp_stdio_message(&mut stdin, &initialize)?;
+    let _ = read_mcp_stdio_response(&mut stdout, 1)?;
+
+    write_mcp_stdio_message(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }),
+    )?;
+
+    let mut request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": method
+    });
+    if let Some(params) = params {
+        request["params"] = params;
+    }
+    write_mcp_stdio_message(&mut stdin, &request)?;
+    let result = read_mcp_stdio_response(&mut stdout, 2);
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+fn write_mcp_stdio_message(stdin: &mut impl Write, value: &Value) -> Result<()> {
+    let line = serde_json::to_string(value)?;
+    stdin.write_all(line.as_bytes())?;
+    stdin.write_all(b"\n")?;
+    stdin.flush()?;
+    Ok(())
+}
+
+fn read_mcp_stdio_response(stdout: &mut impl BufRead, expected_id: i64) -> Result<Value> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = stdout.read_line(&mut line)?;
+        if read == 0 {
+            return Err(ArtifactError::InvalidInput(
+                "MCP stdio server closed stdout before response".into(),
+            ));
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if value.get("id").and_then(Value::as_i64) != Some(expected_id) {
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            return Err(ArtifactError::InvalidInput(format!(
+                "MCP stdio error: {error}"
+            )));
+        }
+        return Ok(value.get("result").cloned().unwrap_or(value));
+    }
+}
+
+fn parse_mcp_http_body(text: &str) -> Result<Value> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(Value::Null);
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return Ok(value);
+    }
+    if let Some(data) = first_sse_data(trimmed) {
+        return serde_json::from_str::<Value>(&data).map_err(ArtifactError::from);
+    }
+    Err(ArtifactError::InvalidInput(
+        "MCP response was not JSON or SSE JSON".into(),
+    ))
+}
+
+fn first_sse_data(text: &str) -> Option<String> {
+    for event in text.split("\n\n") {
+        let data = event
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>();
+        if !data.is_empty() {
+            return Some(data.join("\n"));
+        }
+    }
+    None
+}
+
+fn fetch_text_for_conversion(source: &str) -> Result<String> {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .get(source)
+            .set("User-Agent", "artifact-worker/0.1")
+            .call()
+            .map_err(|error| ArtifactError::InvalidInput(error.to_string()))?
+            .into_string()
+            .map_err(|error| ArtifactError::InvalidInput(error.to_string()));
+    }
+    fs::read_to_string(source).map_err(ArtifactError::from)
+}
+
+fn parse_openapi_spec(spec_text: &str) -> Result<Value> {
+    match serde_json::from_str(spec_text) {
+        Ok(spec) => Ok(spec),
+        Err(json_error) => serde_yml::from_str(spec_text).map_err(|yaml_error| {
+            ArtifactError::InvalidInput(format!(
+                "failed to parse OpenAPI as JSON ({json_error}) or YAML ({yaml_error})"
+            ))
+        }),
+    }
+}
+
+fn openapi_base_url(spec: &Value, source: &str) -> Result<String> {
+    if let Some(server_url) = spec
+        .get("servers")
+        .and_then(Value::as_array)
+        .and_then(|servers| servers.first())
+        .and_then(|server| server.get("url"))
+        .and_then(Value::as_str)
+        .filter(|url| !url.trim().is_empty())
+    {
+        let server_url = server_url.trim();
+        if server_url.starts_with("http://") || server_url.starts_with("https://") {
+            return Ok(server_url.trim_end_matches('/').into());
+        }
+        if let Some(source_origin) = url_origin(source) {
+            return Ok(join_url_path(&source_origin, server_url)
+                .trim_end_matches('/')
+                .into());
+        }
+    }
+    if let Some(host) = spec.get("host").and_then(Value::as_str) {
+        let scheme = spec
+            .get("schemes")
+            .and_then(Value::as_array)
+            .and_then(|schemes| schemes.first())
+            .and_then(Value::as_str)
+            .unwrap_or("https");
+        let base_path = spec
+            .get("basePath")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return Ok(join_url_path(&format!("{scheme}://{host}"), base_path)
+            .trim_end_matches('/')
+            .into());
+    }
+    url_origin(source).ok_or_else(|| {
+        ArtifactError::InvalidInput(
+            "OpenAPI spec needs servers[0].url, host, or an absolute source URL".into(),
+        )
+    })
+}
+
+fn openapi_http_method(method: &str) -> Option<HttpMethod> {
+    match method.to_ascii_lowercase().as_str() {
+        "get" => Some(HttpMethod::Get),
+        "post" => Some(HttpMethod::Post),
+        "put" => Some(HttpMethod::Put),
+        "patch" => Some(HttpMethod::Patch),
+        "delete" => Some(HttpMethod::Delete),
+        _ => None,
+    }
+}
+
+fn openapi_parameters(
+    path_parameters: &[Value],
+    operation: &serde_json::Map<String, Value>,
+) -> Vec<Value> {
+    let mut parameters = path_parameters.to_vec();
+    if let Some(operation_parameters) = operation.get("parameters").and_then(Value::as_array) {
+        parameters.extend(operation_parameters.iter().cloned());
+    }
+    parameters
+}
+
+fn openapi_request_format(
+    parameters: &[Value],
+    operation: &serde_json::Map<String, Value>,
+) -> Value {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+
+    for parameter in parameters {
+        let Some(name) = parameter.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        properties.insert(
+            name.into(),
+            parameter
+                .get("schema")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({ "type": "string" })),
+        );
+        if parameter
+            .get("required")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            required.push(Value::String(name.into()));
+        }
+    }
+
+    if let Some(body_schema) = operation
+        .get("requestBody")
+        .and_then(|body| body.get("content"))
+        .and_then(Value::as_object)
+        .and_then(|content| {
+            content
+                .get("application/json")
+                .or_else(|| content.values().next())
+        })
+        .and_then(|media| media.get("schema"))
+    {
+        properties.insert("body".into(), body_schema.clone());
+        if operation
+            .get("requestBody")
+            .and_then(|body| body.get("required"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            required.push(Value::String("body".into()));
+        }
+    }
+
+    let mut schema = serde_json::json!({
+        "type": "object",
+        "properties": properties
+    });
+    if !required.is_empty() {
+        schema["required"] = Value::Array(required);
+    }
+    schema
+}
+
+fn openapi_response_format(operation: &serde_json::Map<String, Value>) -> Option<Value> {
+    operation
+        .get("responses")
+        .and_then(Value::as_object)
+        .and_then(|responses| {
+            responses
+                .get("200")
+                .or_else(|| responses.get("201"))
+                .or_else(|| responses.get("default"))
+        })
+        .and_then(|response| response.get("content"))
+        .and_then(Value::as_object)
+        .and_then(|content| {
+            content
+                .get("application/json")
+                .or_else(|| content.values().next())
+        })
+        .and_then(|media| media.get("schema"))
+        .cloned()
+}
+
+fn register_bridge_function(function: &VirtualHttpFunction) -> Result<String> {
+    let bridge = bridge_server()?;
+    let key = bridge_key(&function.function_id);
+    bridge
+        .functions
+        .lock()
+        .map_err(|_| ArtifactError::InvalidInput("bridge registry lock poisoned".into()))?
+        .insert(key.clone(), function.clone());
+    Ok(format!("{}/invoke/{}", bridge.base_url, key))
+}
+
+fn bridge_server() -> Result<BridgeServer> {
+    let slot = VIRTUAL_BRIDGE.get_or_init(|| Mutex::new(None));
+    let mut guard = slot
+        .lock()
+        .map_err(|_| ArtifactError::InvalidInput("bridge server lock poisoned".into()))?;
+    if let Some(server) = guard.clone() {
+        return Ok(server);
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let functions = Arc::new(Mutex::new(HashMap::new()));
+    let server = BridgeServer {
+        base_url: format!("http://{addr}"),
+        functions: functions.clone(),
+    };
+
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let functions = functions.clone();
+            thread::spawn(move || handle_bridge_connection(stream, functions));
+        }
+    });
+
+    *guard = Some(server.clone());
+    Ok(server)
+}
+
+fn handle_bridge_connection(
+    mut stream: TcpStream,
+    functions: Arc<Mutex<HashMap<String, VirtualHttpFunction>>>,
+) {
+    let response = match read_bridge_request(&mut stream).and_then(|request| {
+        let Some(key) = request.path.strip_prefix("/invoke/") else {
+            return Err(ArtifactError::InvalidInput("unknown bridge route".into()));
+        };
+        let function = functions
+            .lock()
+            .map_err(|_| ArtifactError::InvalidInput("bridge registry lock poisoned".into()))?
+            .get(key)
+            .cloned()
+            .ok_or_else(|| ArtifactError::InvalidInput("unknown bridge function".into()))?;
+        let payload = if request.body.is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_slice(&request.body)?
+        };
+        invoke_virtual_http_function(&function, payload)
+    }) {
+        Ok(value) => (200, value),
+        Err(error) => (
+            500,
+            serde_json::json!({
+                "error": {
+                    "code": "artifact_bridge_error",
+                    "message": error.to_string()
+                }
+            }),
+        ),
+    };
+
+    let _ = write_bridge_response(&mut stream, response.0, &response.1);
+}
+
+fn read_bridge_request(stream: &mut TcpStream) -> Result<BridgeRequest> {
+    let mut buffer = Vec::new();
+    let mut temp = [0_u8; 4096];
+    let header_end = loop {
+        let read = stream.read(&mut temp)?;
+        if read == 0 {
+            return Err(ArtifactError::InvalidInput("empty bridge request".into()));
+        }
+        buffer.extend_from_slice(&temp[..read]);
+        if let Some(index) = find_header_end(&buffer) {
+            break index;
+        }
+        if buffer.len() > 1024 * 1024 {
+            return Err(ArtifactError::InvalidInput(
+                "bridge request too large".into(),
+            ));
+        }
+    };
+
+    let headers_text = String::from_utf8_lossy(&buffer[..header_end]);
+    let mut lines = headers_text.lines();
+    let request_line = lines
+        .next()
+        .ok_or_else(|| ArtifactError::InvalidInput("missing bridge request line".into()))?;
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| ArtifactError::InvalidInput("missing bridge request path".into()))?
+        .to_string();
+    let content_length = lines
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let body_start = header_end + 4;
+    while buffer.len() < body_start + content_length {
+        let read = stream.read(&mut temp)?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&temp[..read]);
+    }
+    let body = buffer
+        .get(body_start..body_start + content_length.min(buffer.len().saturating_sub(body_start)))
+        .unwrap_or_default()
+        .to_vec();
+
+    Ok(BridgeRequest { path, body })
+}
+
+fn invoke_virtual_http_function(function: &VirtualHttpFunction, payload: Value) -> Result<Value> {
+    let payload = strip_iii_runtime_fields(payload);
+    match &function.invocation {
+        VirtualInvocation::Http => invoke_plain_virtual_http_function(function, payload),
+        VirtualInvocation::McpTool { tool_name } => mcp_tool_call(
+            function.mcp_transport.as_ref().ok_or_else(|| {
+                ArtifactError::InvalidInput("MCP function is missing transport".into())
+            })?,
+            tool_name,
+            payload,
+        ),
+        VirtualInvocation::McpToolsList => {
+            mcp_list_tools(function.mcp_transport.as_ref().ok_or_else(|| {
+                ArtifactError::InvalidInput("MCP function is missing transport".into())
+            })?)
+            .map(|tools| serde_json::json!({ "tools": tools }))
+        }
+        VirtualInvocation::McpToolCall => {
+            let tool_name = payload.get("name").and_then(Value::as_str).ok_or_else(|| {
+                ArtifactError::InvalidInput("MCP tool_call payload requires name".into())
+            })?;
+            let arguments = payload
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            mcp_tool_call(
+                function.mcp_transport.as_ref().ok_or_else(|| {
+                    ArtifactError::InvalidInput("MCP function is missing transport".into())
+                })?,
+                tool_name,
+                arguments,
+            )
+        }
+    }
+}
+
+fn invoke_plain_virtual_http_function(
+    function: &VirtualHttpFunction,
+    payload: Value,
+) -> Result<Value> {
+    let url = virtual_function_url(function, &payload);
+    let body = virtual_function_body(&payload);
+    let (status, text) = send_virtual_http(&function.method, &url, &body)?;
+    parse_virtual_http_response(status, text)
+}
+
+fn send_virtual_http(method: &HttpMethod, url: &str, body: &Value) -> Result<(u16, String)> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
+    let body_text = serde_json::to_string(body)?;
+    let result = match method {
+        HttpMethod::Get => agent
+            .get(url)
+            .set("User-Agent", "artifact-worker/0.1")
+            .call(),
+        HttpMethod::Post => agent
+            .post(url)
+            .set("User-Agent", "artifact-worker/0.1")
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json, text/event-stream")
+            .send_string(&body_text),
+        HttpMethod::Put => agent
+            .put(url)
+            .set("User-Agent", "artifact-worker/0.1")
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json, text/event-stream")
+            .send_string(&body_text),
+        HttpMethod::Patch => agent
+            .request("PATCH", url)
+            .set("User-Agent", "artifact-worker/0.1")
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json, text/event-stream")
+            .send_string(&body_text),
+        HttpMethod::Delete => agent
+            .delete(url)
+            .set("User-Agent", "artifact-worker/0.1")
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json, text/event-stream")
+            .send_string(&body_text),
+    };
+    match result {
+        Ok(response) => {
+            let status = response.status();
+            let text = response
+                .into_string()
+                .map_err(|error| ArtifactError::InvalidInput(error.to_string()))?;
+            Ok((status, text))
+        }
+        Err(ureq::Error::Status(status, response)) => {
+            let text = response.into_string().unwrap_or_default();
+            Ok((status, text))
+        }
+        Err(error) => Err(ArtifactError::InvalidInput(error.to_string())),
+    }
+}
+
+fn parse_virtual_http_response(status: u16, text: String) -> Result<Value> {
+    if text.trim().is_empty() {
+        return Ok(serde_json::json!({ "ok": status < 400, "status": status }));
+    }
+    match serde_json::from_str::<Value>(&text) {
+        Ok(value) => Ok(value),
+        Err(_) => Ok(serde_json::json!({
+            "ok": status < 400,
+            "status": status,
+            "body": text
+        })),
+    }
+}
+
+fn virtual_function_url(function: &VirtualHttpFunction, payload: &Value) -> String {
+    let mut url = apply_path_parameters(&function.url, payload);
+    if matches!(function.method, HttpMethod::Get) {
+        let path_keys = path_parameter_names(&function.url);
+        let query = query_string(payload, &path_keys);
+        if !query.is_empty() {
+            let separator = if url.contains('?') { '&' } else { '?' };
+            url.push(separator);
+            url.push_str(&query);
+        }
+    }
+    url
+}
+
+fn virtual_function_body(payload: &Value) -> Value {
+    payload
+        .get("body")
+        .cloned()
+        .unwrap_or_else(|| payload.clone())
+}
+
+fn apply_path_parameters(url: &str, payload: &Value) -> String {
+    let mut rendered = url.to_string();
+    let Some(object) = payload.as_object() else {
+        return rendered;
+    };
+    for (key, value) in object {
+        let token = format!("{{{key}}}");
+        if rendered.contains(&token) {
+            rendered = rendered.replace(&token, &query_value(value));
+        }
+    }
+    rendered
+}
+
+fn path_parameter_names(url: &str) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    let mut rest = url;
+    while let Some(start) = rest.find('{') {
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find('}') else {
+            break;
+        };
+        let key = after_start[..end].trim();
+        if !key.is_empty() {
+            keys.insert(key.to_string());
+        }
+        rest = &after_start[end + 1..];
+    }
+    keys
+}
+
+fn query_string(payload: &Value, path_keys: &HashSet<String>) -> String {
+    payload
+        .as_object()
+        .map(|object| {
+            object
+                .iter()
+                .filter(|(key, value)| {
+                    *key != "body" && !path_keys.contains(*key) && is_query_scalar(value)
+                })
+                .map(|(key, value)| format!("{}={}", percent_encode(key), query_value(value)))
+                .collect::<Vec<_>>()
+                .join("&")
+        })
+        .unwrap_or_default()
+}
+
+fn is_query_scalar(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null
+    )
+}
+
+fn query_value(value: &Value) -> String {
+    match value {
+        Value::String(value) => percent_encode(value),
+        Value::Number(value) => percent_encode(&value.to_string()),
+        Value::Bool(value) => percent_encode(if *value { "true" } else { "false" }),
+        Value::Null => String::new(),
+        other => percent_encode(&other.to_string()),
+    }
+}
+
+fn percent_encode(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            byte => format!("%{byte:02X}").chars().collect::<Vec<_>>(),
+        })
+        .collect()
+}
+
+fn strip_iii_runtime_fields(payload: Value) -> Value {
+    let Value::Object(mut object) = payload else {
+        return payload;
+    };
+    object.retain(|key, _| {
+        !key.starts_with("_caller_") && !key.starts_with("_iii_") && !key.starts_with("_trace_")
+    });
+    Value::Object(object)
+}
+
+fn write_bridge_response(stream: &mut TcpStream, status: u16, value: &Value) -> Result<()> {
+    let body = serde_json::to_vec(value)?;
+    let status_text = if status < 400 { "OK" } else { "ERROR" };
+    let header = format!(
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn generated_function_refs() -> &'static Mutex<HashMap<String, FunctionRef>> {
+    GENERATED_FUNCTION_REFS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn bridge_key(function_id: &str) -> String {
+    function_id
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn empty_object_schema() -> Value {
+    serde_json::json!({ "type": "object", "properties": {} })
+}
+
+fn http_method_label(method: &HttpMethod) -> &'static str {
+    match method {
+        HttpMethod::Get => "GET",
+        HttpMethod::Post => "POST",
+        HttpMethod::Put => "PUT",
+        HttpMethod::Patch => "PATCH",
+        HttpMethod::Delete => "DELETE",
+    }
+}
+
+fn unique_function_id(namespace: &str, slug: String, seen: &mut HashSet<String>) -> String {
+    let base = format!("{}::{}", namespace, slug);
+    if seen.insert(base.clone()) {
+        return base;
+    }
+    let mut index = 2;
+    loop {
+        let candidate = format!("{base}_{index}");
+        if seen.insert(candidate.clone()) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn function_local_name(function_id: &str, namespace: &str) -> String {
+    function_id
+        .strip_prefix(&format!("{namespace}::"))
+        .unwrap_or(function_id)
+        .to_string()
 }
 
 fn infer_source_type_from_source(source: &str) -> SourceType {
     let lower = source.to_lowercase();
-    if lower.contains("mcp") {
+    if lower.starts_with("stdio:") || lower.contains("mcp") {
         SourceType::Mcp
+    } else if lower.contains("openapi")
+        || lower.contains("swagger")
+        || lower.ends_with(".openapi.json")
+        || lower.ends_with(".openapi.yaml")
+        || lower.ends_with(".openapi.yml")
+    {
+        SourceType::OpenApi
     } else if lower.starts_with("http://") || lower.starts_with("https://") {
         SourceType::Url
     } else {
@@ -1271,20 +1551,9 @@ fn infer_source_type_from_source(source: &str) -> SourceType {
 }
 
 fn infer_name_from_source(source: &str) -> String {
-    let lower_source = source.to_lowercase();
-    if let Some(recipe) = worker_recipes().into_iter().find(|recipe| {
-        recipe
-            .source_hints
-            .iter()
-            .any(|hint| lower_source.contains(&hint.to_lowercase()))
-            || recipe.research_links.iter().any(|link| {
-                let lower_link = link.to_lowercase();
-                lower_source.contains(&lower_link) || lower_link.contains(&lower_source)
-            })
-    }) {
-        return recipe.name;
+    if source.starts_with("stdio:") {
+        return "mcp_stdio".into();
     }
-
     let no_scheme = source
         .trim()
         .trim_start_matches("https://")
@@ -1299,7 +1568,6 @@ fn infer_name_from_source(source: &str) -> String {
     if parts.len() >= 5 && parts[0].contains("github.com") && matches!(parts[3], "tree" | "blob") {
         return parts.last().copied().unwrap_or("artifact").to_string();
     }
-
     if parts.len() >= 3 && parts[0].contains("github.com") {
         return format!("{}-{}", parts[1], parts[2]);
     }
@@ -1312,1414 +1580,8 @@ fn infer_name_from_source(source: &str) -> String {
         .trim_end_matches(".json")
         .trim_end_matches(".yaml")
         .trim_end_matches(".yml")
+        .trim_end_matches(".openapi")
         .to_string()
-}
-
-fn push_unique(values: &mut Vec<String>, value: &str) {
-    if !values.iter().any(|existing| existing == value) {
-        values.push(value.into());
-    }
-}
-
-fn infer_functions(input: &ArtifactInput) -> Vec<String> {
-    if !input.functions.is_empty() {
-        return input.functions.clone();
-    }
-    let haystack = format!(
-        "{} {} {}",
-        input.goal.as_deref().unwrap_or_default(),
-        input.source.as_deref().unwrap_or_default(),
-        input.name
-    )
-    .to_lowercase();
-
-    let name = input.name.to_lowercase();
-    if let Some(recipe) = matching_recipe(&name, &haystack) {
-        return recipe.default_functions;
-    }
-    if name.contains("hackernews") || name == "hn" || haystack.contains("top stories") {
-        return vec![
-            "top_stories".into(),
-            "get_item".into(),
-            "search_cached_stories".into(),
-        ];
-    }
-    if haystack.contains("issue") || haystack.contains("linear") || haystack.contains("jira") {
-        return vec![
-            "list_items".into(),
-            "blocked_items".into(),
-            "risk_summary".into(),
-        ];
-    }
-    if haystack.contains("search") || haystack.contains("docs") {
-        return vec![
-            "search".into(),
-            "get_document".into(),
-            "answer_with_sources".into(),
-        ];
-    }
-    if haystack.contains("github") || haystack.contains("repo") || haystack.contains("pull request")
-    {
-        return vec![
-            "repo_summary".into(),
-            "stale_prs".into(),
-            "open_issues".into(),
-        ];
-    }
-    vec!["inspect".into(), "list".into(), "get".into()]
-}
-
-fn matching_recipe(name: &str, haystack: &str) -> Option<WorkerRecipe> {
-    worker_recipes().into_iter().find(|recipe| {
-        recipe.name == name
-            || recipe.source_hints.iter().any(|hint| {
-                let hint = hint.to_lowercase();
-                name.contains(&hint) || haystack.contains(&hint)
-            })
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FunctionIntent {
-    Top,
-    Search,
-    Highlight,
-    Lookup,
-    Status,
-    Sync,
-    Generic,
-}
-
-fn classify_intent(clean: &str) -> FunctionIntent {
-    let tokens = clean
-        .split('_')
-        .filter(|token| !token.is_empty())
-        .collect::<Vec<_>>();
-    let has_any = |needles: &[&str]| {
-        tokens
-            .iter()
-            .any(|token| needles.iter().any(|needle| token == needle))
-    };
-
-    if has_any(&["sync", "refresh"]) {
-        FunctionIntent::Sync
-    } else if has_any(&[
-        "highlight",
-        "highlights",
-        "summary",
-        "summaries",
-        "brief",
-        "digest",
-    ]) {
-        FunctionIntent::Highlight
-    } else if has_any(&["status", "pipeline", "health", "metric", "metrics"]) {
-        FunctionIntent::Status
-    } else if has_any(&[
-        "lookup", "rank", "author", "maker", "profile", "detail", "details", "item", "person",
-        "handle",
-    ]) {
-        FunctionIntent::Lookup
-    } else if has_any(&["search", "query", "topic"]) {
-        FunctionIntent::Search
-    } else if has_any(&[
-        "top", "trend", "trends", "trending", "popular", "latest", "launch", "launches",
-    ]) {
-        FunctionIntent::Top
-    } else {
-        FunctionIntent::Generic
-    }
-}
-
-fn plan_function(namespace: &str, function: &str) -> WorkerFunctionPlan {
-    let clean = slugify(function);
-    let intent = classify_intent(&clean);
-    let (purpose, inputs, output) = match intent {
-        FunctionIntent::Top => (
-            format!(
-                "Return top {} items for agent summaries.",
-                titleize(namespace)
-            ),
-            serde_json::json!({ "limit": "number optional; default 10", "window": "string optional; today|24h|7d" }),
-            serde_json::json!({ "items": "ranked public items with title, summary, rank, and source URL" }),
-        ),
-        FunctionIntent::Search => (
-            format!("Search {} source data with citations.", titleize(namespace)),
-            serde_json::json!({ "query": "string topic", "limit": "number optional", "since": "string optional duration like 24h or 7d" }),
-            serde_json::json!({ "matches": "ranked matches with title, summary, and source URL" }),
-        ),
-        FunctionIntent::Highlight => (
-            format!(
-                "Create a concise {} highlight artifact from a URL or structured thread payload.",
-                titleize(namespace)
-            ),
-            serde_json::json!({ "url": "string optional", "id": "string optional", "threadId": "string optional", "prompt": "object optional", "replies": "array optional" }),
-            serde_json::json!({ "text": "monospace-friendly highlight artifact", "source": "source URL when fetched" }),
-        ),
-        FunctionIntent::Lookup => (
-            format!(
-                "Look up a person, author, maker, or handle in {} source data.",
-                titleize(namespace)
-            ),
-            serde_json::json!({ "handle": "string optional", "name": "string optional", "query": "string optional" }),
-            serde_json::json!({ "match": "best matching public source line with context" }),
-        ),
-        FunctionIntent::Status => (
-            format!(
-                "Read {} public source status and recent visible signals.",
-                titleize(namespace)
-            ),
-            serde_json::json!({ "watch": "boolean optional", "since": "string optional duration" }),
-            serde_json::json!({ "status": "short source reachability/status summary" }),
-        ),
-        FunctionIntent::Sync => (
-            format!("Sync source data for the {} worker.", namespace),
-            serde_json::json!({ "force": "boolean optional; bypass cache when true" }),
-            serde_json::json!({ "ok": "boolean success flag", "synced": "sync result payload" }),
-        ),
-        FunctionIntent::Generic => (
-            format!("{} for the {} worker", titleize(&clean), namespace),
-            serde_json::json!({ "query": "string/object; focused request payload for this function" }),
-            serde_json::json!({
-                "ok": "boolean success flag",
-                "data": "function-specific result payload",
-                "sources": "optional source/provenance list"
-            }),
-        ),
-    };
-
-    WorkerFunctionPlan {
-        function_id: format!("{}::{}", namespace, clean),
-        purpose,
-        side_effects: if matches!(intent, FunctionIntent::Sync) {
-            SideEffects::Sync
-        } else {
-            SideEffects::ExternalCall
-        },
-        inputs,
-        output,
-    }
-}
-
-fn render_worker_source(plan: &WorkerPlan) -> String {
-    if uses_live_http_template(plan) {
-        return render_public_source_worker_source(plan);
-    }
-    render_placeholder_worker_source(plan)
-}
-
-fn uses_live_http_template(plan: &WorkerPlan) -> bool {
-    plan.source
-        .as_deref()
-        .map(|source| source.starts_with("http://") || source.starts_with("https://"))
-        .unwrap_or(false)
-}
-
-fn render_placeholder_worker_source(plan: &WorkerPlan) -> String {
-    let reused_workers = json_string_array(&plan.uses_workers);
-    let registrations = plan
-        .functions
-        .iter()
-        .map(|function| {
-            format!(
-                r#"    iii.register_function(RegisterFunction::new("{function_id}", |payload: serde_json::Value| -> Result<serde_json::Value, String> {{
-        Ok(serde_json::json!({{
-            "ok": true,
-            "functionId": "{function_id}",
-            "payload": payload,
-            "reusedWorkers": {reused_workers},
-            "todo": "implement {purpose}"
-        }}))
-    }}).description("{purpose}"));
-"#,
-                function_id = function.function_id,
-                purpose = function.purpose,
-                reused_workers = reused_workers
-            )
-        })
-        .collect::<String>();
-
-    format!(
-        r#"use iii_sdk::{{register_worker, InitOptions, RegisterFunction, RegisterServiceMessage}};
-
-fn main() {{
-    let engine_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&engine_url, InitOptions::default());
-    iii.register_service(RegisterServiceMessage {{
-        id: "{worker_name}".into(),
-        name: "{worker_name}".into(),
-        description: Some("Generated Artifact Rust iii worker".into()),
-        parent_service_id: None,
-    }});
-{registrations}    println!("{worker_name} registered functions against {{engine_url}}");
-    std::thread::park();
-    iii.shutdown();
-}}
-"#,
-        worker_name = plan.worker_name,
-        registrations = registrations
-    )
-}
-
-fn render_public_source_worker_source(plan: &WorkerPlan) -> String {
-    let reused_workers = json_string_array(&plan.uses_workers);
-    let registrations = plan
-        .functions
-        .iter()
-        .map(|function| {
-            let function_name = function
-                .function_id
-                .rsplit_once("::")
-                .map(|(_, name)| name)
-                .unwrap_or(function.function_id.as_str());
-            format!(
-                r#"    iii.register_function(RegisterFunction::new("{function_id}", |payload: serde_json::Value| -> Result<serde_json::Value, String> {{
-        handle_source_function("{function_id}", "{function_name}", payload, serde_json::json!({reused_workers}))
-    }}).description("{purpose}"));
-"#,
-                function_id = function.function_id,
-                function_name = function_name,
-                purpose = function.purpose,
-                reused_workers = reused_workers
-            )
-        })
-        .collect::<String>();
-    let source_url = serde_json::to_string(plan.source.as_deref().unwrap_or_default())
-        .unwrap_or_else(|_| "\"\"".into());
-    let source_name = serde_json::to_string(&canonical_source_name(&plan.namespace))
-        .unwrap_or_else(|_| "\"source\"".into());
-
-    r#"use iii_sdk::{register_worker, InitOptions, RegisterFunction, RegisterServiceMessage};
-use serde_json::Value;
-
-const SOURCE_URL: &str = __SOURCE_URL__;
-const SOURCE_NAME: &str = __SOURCE_NAME__;
-
-fn main() {
-    let engine_url = std::env::var("III_URL").unwrap_or_else(|_| "ws://localhost:49134".to_string());
-    let iii = register_worker(&engine_url, InitOptions::default());
-    iii.register_service(RegisterServiceMessage {
-        id: "__WORKER_NAME__".into(),
-        name: "__WORKER_NAME__".into(),
-        description: Some("Generated Artifact Rust iii worker".into()),
-        parent_service_id: None,
-    });
-__REGISTRATIONS__    println!("__WORKER_NAME__ registered functions against {engine_url}");
-    std::thread::park();
-    iii.shutdown();
-}
-
-fn handle_source_function(
-    function_id: &str,
-    function_name: &str,
-    payload: Value,
-    reused_workers: Value,
-) -> Result<Value, String> {
-    if SOURCE_NAME == "hackernews" {
-        return handle_hackernews_function(function_id, function_name, payload, reused_workers);
-    }
-    if SOURCE_NAME == "producthunt" {
-        return handle_producthunt_function(function_id, function_name, payload, reused_workers);
-    }
-
-    if has_thread_payload(&payload)
-        || function_name.contains("highlight")
-        || function_name.contains("summary")
-        || function_name.contains("brief")
-        || function_name.contains("digest")
-    {
-        return source_highlights(function_id, payload, reused_workers);
-    }
-    if function_name.contains("top")
-        || function_name.contains("trend")
-        || function_name.contains("launch")
-        || function_name.contains("list")
-    {
-        return source_top_items(function_id, payload, reused_workers);
-    }
-    if function_name.contains("search") {
-        return source_search(function_id, payload, reused_workers);
-    }
-    if function_name.contains("rank")
-        || function_name.contains("author")
-        || function_name.contains("maker")
-        || function_name.contains("profile")
-    {
-        return source_lookup(function_id, payload, reused_workers);
-    }
-    if function_name.contains("status")
-        || function_name.contains("pipeline")
-        || function_name.contains("health")
-    {
-        return source_status(function_id, payload, reused_workers);
-    }
-    source_lookup(function_id, payload, reused_workers)
-}
-
-fn handle_hackernews_function(
-    function_id: &str,
-    function_name: &str,
-    payload: Value,
-    reused_workers: Value,
-) -> Result<Value, String> {
-    if function_name.contains("top") || function_name.contains("list") {
-        return hackernews_top_stories(function_id, payload, reused_workers);
-    }
-    if function_name.contains("search") {
-        return hackernews_search(function_id, payload, reused_workers);
-    }
-    if function_name.contains("item") || function_name.contains("get") || function_name.contains("lookup") {
-        return hackernews_get_item(function_id, payload, reused_workers);
-    }
-    hackernews_search(function_id, payload, reused_workers)
-}
-
-fn hackernews_top_stories(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
-    let limit = payload_number(&payload, "limit").unwrap_or(10).clamp(1, 30) as usize;
-    let ids = fetch_json("https://hacker-news.firebaseio.com/v0/topstories.json")?;
-    let mut items = Vec::new();
-    if let Some(ids) = ids.as_array() {
-        for id in ids.iter().filter_map(Value::as_i64).take(limit) {
-            if let Ok(item) = hackernews_item(id) {
-                items.push(hackernews_story_value(items.len() + 1, &item));
-            }
-        }
-    }
-    Ok(serde_json::json!({
-        "ok": true,
-        "functionId": function_id,
-        "source": "https://hacker-news.firebaseio.com/v0/topstories.json",
-        "items": items,
-        "reusedWorkers": reused_workers
-    }))
-}
-
-fn hackernews_get_item(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
-    if let Some(id) = payload_number(&payload, "id").or_else(|| payload_text(&payload, &["id"]).and_then(|id| id.parse::<i64>().ok())) {
-        let item = hackernews_item(id)?;
-        return Ok(serde_json::json!({
-            "ok": true,
-            "functionId": function_id,
-            "source": format!("https://hacker-news.firebaseio.com/v0/item/{id}.json"),
-            "item": hackernews_story_value(1, &item),
-            "raw": item,
-            "reusedWorkers": reused_workers
-        }));
-    }
-    if payload_text(&payload, &["query", "q", "title"]).is_some() {
-        return hackernews_search(function_id, payload, reused_workers);
-    }
-    Ok(serde_json::json!({
-        "ok": false,
-        "functionId": function_id,
-        "error": "provide an HN item id or query",
-        "reusedWorkers": reused_workers
-    }))
-}
-
-fn hackernews_search(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
-    let query = payload_text(&payload, &["query", "q", "title"]).unwrap_or_default();
-    let limit = payload_number(&payload, "limit").unwrap_or(10).clamp(1, 30) as usize;
-    let url = format!(
-        "https://hn.algolia.com/api/v1/search?tags=story&query={}",
-        url_encode(&query)
-    );
-    let data = fetch_json(&url)?;
-    let mut matches = Vec::new();
-    if let Some(hits) = data.get("hits").and_then(Value::as_array) {
-        for hit in hits.iter().take(limit) {
-            matches.push(serde_json::json!({
-                "id": hit.get("objectID").and_then(Value::as_str).unwrap_or_default(),
-                "title": hit.get("title").and_then(Value::as_str).or_else(|| hit.get("story_title").and_then(Value::as_str)).unwrap_or_default(),
-                "url": hit.get("url").and_then(Value::as_str).or_else(|| hit.get("story_url").and_then(Value::as_str)).unwrap_or_default(),
-                "author": hit.get("author").and_then(Value::as_str).unwrap_or_default(),
-                "points": hit.get("points").and_then(Value::as_i64).unwrap_or_default(),
-                "comments": hit.get("num_comments").and_then(Value::as_i64).unwrap_or_default(),
-                "createdAt": hit.get("created_at").and_then(Value::as_str).unwrap_or_default()
-            }));
-        }
-    }
-    Ok(serde_json::json!({
-        "ok": true,
-        "functionId": function_id,
-        "query": query,
-        "source": url,
-        "matches": matches,
-        "reusedWorkers": reused_workers
-    }))
-}
-
-fn hackernews_item(id: i64) -> Result<Value, String> {
-    fetch_json(&format!("https://hacker-news.firebaseio.com/v0/item/{id}.json"))
-}
-
-fn hackernews_story_value(rank: usize, item: &Value) -> Value {
-    let id = item.get("id").and_then(Value::as_i64).unwrap_or_default();
-    serde_json::json!({
-        "rank": rank,
-        "id": id,
-        "title": item.get("title").and_then(Value::as_str).unwrap_or_default(),
-        "url": item.get("url").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("https://news.ycombinator.com/item?id={id}")),
-        "author": item.get("by").and_then(Value::as_str).unwrap_or_default(),
-        "score": item.get("score").and_then(Value::as_i64).unwrap_or_default(),
-        "comments": item.get("descendants").and_then(Value::as_i64).unwrap_or_default(),
-        "time": item.get("time").and_then(Value::as_i64).unwrap_or_default(),
-        "type": item.get("type").and_then(Value::as_str).unwrap_or_default()
-    })
-}
-
-fn handle_producthunt_function(
-    function_id: &str,
-    function_name: &str,
-    payload: Value,
-    reused_workers: Value,
-) -> Result<Value, String> {
-    if function_name.contains("lookup") || function_name.contains("detail") {
-        return producthunt_details(function_id, payload, reused_workers);
-    }
-    if function_name.contains("search") {
-        return producthunt_search(function_id, payload, reused_workers);
-    }
-    if function_name.contains("metric") || function_name.contains("status") {
-        return producthunt_metrics(function_id, payload, reused_workers);
-    }
-    producthunt_top_launches(function_id, payload, reused_workers)
-}
-
-fn producthunt_top_launches(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
-    let limit = payload_number(&payload, "limit").unwrap_or(10).clamp(1, 30) as usize;
-    let feed = fetch_text("https://www.producthunt.com/feed")?;
-    let launches = producthunt_feed_items(&feed, limit);
-    Ok(serde_json::json!({
-        "ok": true,
-        "functionId": function_id,
-        "source": "https://www.producthunt.com/feed",
-        "items": launches,
-        "reusedWorkers": reused_workers
-    }))
-}
-
-fn producthunt_details(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
-    let feed = fetch_text("https://www.producthunt.com/feed")?;
-    let launches = producthunt_feed_items(&feed, 60);
-    let id = payload_text(&payload, &["id", "postId", "productId"]);
-    let url = payload_text(&payload, &["url", "postUrl", "productUrl"])
-        .map(|url| url.trim_end_matches('/').to_string());
-    let title = payload_text(&payload, &["title", "name"])
-        .map(|title| title.to_lowercase());
-
-    let item = launches.iter().find(|launch| {
-        let launch_id = launch.get("id").and_then(Value::as_str).unwrap_or_default();
-        let launch_url = launch
-            .get("url")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim_end_matches('/');
-        let launch_title = launch
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_lowercase();
-        id.as_deref().is_some_and(|id| id == launch_id)
-            || url.as_deref().is_some_and(|url| url == launch_url)
-            || title.as_deref().is_some_and(|title| title == launch_title)
-    });
-
-    if let Some(item) = item {
-        return Ok(serde_json::json!({
-            "ok": true,
-            "functionId": function_id,
-            "source": "https://www.producthunt.com/feed",
-            "item": item,
-            "items": [item],
-            "reusedWorkers": reused_workers
-        }));
-    }
-
-    producthunt_search(function_id, payload, reused_workers)
-}
-
-fn producthunt_search(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
-    let query = payload_text(&payload, &["query", "q", "topic", "name", "handle"]).unwrap_or_default();
-    let lower_query = query.to_lowercase();
-    let limit = payload_number(&payload, "limit").unwrap_or(10).clamp(1, 30) as usize;
-    let feed = fetch_text("https://www.producthunt.com/feed")?;
-    let mut matches = producthunt_feed_items(&feed, 60)
-        .into_iter()
-        .filter(|item| {
-            if lower_query.is_empty() {
-                true
-            } else {
-                item.get("title").and_then(Value::as_str).unwrap_or_default().to_lowercase().contains(&lower_query)
-                    || item.get("summary").and_then(Value::as_str).unwrap_or_default().to_lowercase().contains(&lower_query)
-                    || item.get("author").and_then(Value::as_str).unwrap_or_default().to_lowercase().contains(&lower_query)
-            }
-        })
-        .collect::<Vec<_>>();
-    matches.truncate(limit);
-    Ok(serde_json::json!({
-        "ok": true,
-        "functionId": function_id,
-        "query": query,
-        "source": "https://www.producthunt.com/feed",
-        "matches": matches,
-        "reusedWorkers": reused_workers
-    }))
-}
-
-fn producthunt_metrics(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
-    let feed = fetch_text("https://www.producthunt.com/feed")?;
-    let limit = payload_number(&payload, "limit").unwrap_or(10).clamp(1, 30) as usize;
-    let launches = producthunt_feed_items(&feed, limit);
-    Ok(serde_json::json!({
-        "ok": true,
-        "functionId": function_id,
-        "source": "https://www.producthunt.com/feed",
-        "updated": xml_tag(&feed, "updated"),
-        "launchCount": launches.len(),
-        "recentLaunches": launches,
-        "reusedWorkers": reused_workers
-    }))
-}
-
-fn producthunt_feed_items(feed: &str, limit: usize) -> Vec<Value> {
-    let mut items = Vec::new();
-    for entry in feed.split("<entry>").skip(1) {
-        let entry = entry.split("</entry>").next().unwrap_or(entry);
-        let title = xml_tag(entry, "title").unwrap_or_default();
-        if title.is_empty() {
-            continue;
-        }
-        let content = xml_tag(entry, "content").unwrap_or_default();
-        let summary = first_clean_text(&content);
-        items.push(serde_json::json!({
-            "rank": items.len() + 1,
-            "id": producthunt_post_id(entry).unwrap_or_default(),
-            "title": title,
-            "summary": summary,
-            "url": xml_link_href(entry).unwrap_or_default(),
-            "author": xml_author(entry).unwrap_or_default(),
-            "published": xml_tag(entry, "published").unwrap_or_default(),
-            "updated": xml_tag(entry, "updated").unwrap_or_default()
-        }));
-        if items.len() >= limit {
-            break;
-        }
-    }
-    items
-}
-
-fn producthunt_post_id(entry: &str) -> Option<String> {
-    xml_tag(entry, "id")
-        .and_then(|id| id.rsplit('/').next().map(str::to_string))
-        .filter(|id| !id.is_empty())
-}
-
-fn xml_author(entry: &str) -> Option<String> {
-    let author = entry.split("<author>").nth(1)?.split("</author>").next()?;
-    xml_tag(author, "name")
-}
-
-fn xml_link_href(entry: &str) -> Option<String> {
-    for line in entry.lines() {
-        if line.contains("<link") && line.contains("rel=\"alternate\"") {
-            let rest = line.split("href=\"").nth(1)?;
-            return rest.split('"').next().map(str::to_string);
-        }
-    }
-    None
-}
-
-fn xml_tag(text: &str, tag: &str) -> Option<String> {
-    let marker = format!("<{tag}");
-    let start = text.find(&marker)?;
-    let after = &text[start + marker.len()..];
-    let value_start = after.find('>')? + 1;
-    let body = &after[value_start..];
-    let end = body.find(&format!("</{tag}>"))?;
-    Some(decode_entities(body[..end].trim()).trim().to_string())
-}
-
-fn first_clean_text(value: &str) -> String {
-    clean_lines(&html_to_text(&decode_entities(value)))
-        .into_iter()
-        .next()
-        .unwrap_or_default()
-}
-
-fn fetch_json(url: &str) -> Result<Value, String> {
-    let text = fetch_text(url)?;
-    serde_json::from_str(&text).map_err(|error| format!("{url}: {error}"))
-}
-
-fn url_encode(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char)
-            }
-            b' ' => encoded.push('+'),
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
-}
-
-fn source_top_items(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
-    let limit = payload_number(&payload, "limit").unwrap_or(10).clamp(1, 30) as usize;
-    let page = fetch_text(SOURCE_URL)?;
-    let text = readable_text(&page);
-    let items = extract_items(&text, limit);
-    Ok(serde_json::json!({
-        "ok": true,
-        "functionId": function_id,
-        "source": SOURCE_URL,
-        "items": items,
-        "reusedWorkers": reused_workers
-    }))
-}
-
-fn source_search(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
-    let query = payload_text(&payload, &["query", "q", "topic"]).unwrap_or_default().to_lowercase();
-    let page = fetch_text(SOURCE_URL)?;
-    let text = readable_text(&page);
-    let mut matches = extract_items(&text, 30)
-        .into_iter()
-        .filter(|item| {
-            if query.is_empty() {
-                true
-            } else {
-                item["title"].as_str().unwrap_or_default().to_lowercase().contains(&query)
-                    || item["summary"].as_str().unwrap_or_default().to_lowercase().contains(&query)
-            }
-        })
-        .collect::<Vec<_>>();
-    let limit = payload_number(&payload, "limit").unwrap_or(10).clamp(1, 30) as usize;
-    matches.truncate(limit);
-    Ok(serde_json::json!({
-        "ok": true,
-        "functionId": function_id,
-        "query": query,
-        "matches": matches,
-        "source": SOURCE_URL,
-        "reusedWorkers": reused_workers
-    }))
-}
-
-fn source_highlights(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
-    if has_thread_payload(&payload) {
-        let text = format_thread_highlights(&payload);
-        return Ok(serde_json::json!({
-            "ok": true,
-            "functionId": function_id,
-            "mode": "thread_payload",
-            "text": text,
-            "reusedWorkers": reused_workers
-        }));
-    }
-
-    let url = source_url(&payload);
-    let page = fetch_text(&url)?;
-    let text = readable_text(&page);
-    let title = first_item_title(&text).unwrap_or_else(|| format!("{SOURCE_NAME} source item"));
-    let summary = first_long_paragraph(&text, &title).unwrap_or_else(|| "No summary was found in the public source page.".into());
-    let mut links = extract_action_lines(&text, 6);
-    if links.is_empty() {
-        links = extract_source_links(&page, 6);
-    }
-    let rendered = render_page_highlights(&title, &summary, &links, &url);
-
-    Ok(serde_json::json!({
-        "ok": true,
-        "functionId": function_id,
-        "mode": "source_page",
-        "title": title,
-        "summary": summary,
-        "links": links,
-        "text": rendered,
-        "source": url,
-        "reusedWorkers": reused_workers
-    }))
-}
-
-fn source_lookup(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
-    let query = payload_text(&payload, &["query", "handle", "xHandle", "username", "name"])
-        .unwrap_or_default()
-        .trim_start_matches('@')
-        .to_string();
-    let url = source_url(&payload);
-    let page = fetch_text(&url)?;
-    let text = readable_text(&page);
-    let matched = find_matching_line(&text, &query);
-    Ok(serde_json::json!({
-        "ok": true,
-        "functionId": function_id,
-        "query": query,
-        "match": matched,
-        "source": url,
-        "reusedWorkers": reused_workers
-    }))
-}
-
-fn source_status(function_id: &str, payload: Value, reused_workers: Value) -> Result<Value, String> {
-    let page = fetch_text(SOURCE_URL)?;
-    let text = readable_text(&page);
-    let status = text
-        .lines()
-        .find(|line| {
-            let lower = line.to_lowercase();
-            lower.contains("status")
-                || lower.contains("posts:")
-                || lower.contains("updated")
-                || lower.contains("fresh")
-                || lower.contains("next")
-        })
-        .unwrap_or("Source page reachable.")
-        .trim()
-        .to_string();
-    Ok(serde_json::json!({
-        "ok": true,
-        "functionId": function_id,
-        "status": status,
-        "payload": payload,
-        "source": SOURCE_URL,
-        "reusedWorkers": reused_workers
-    }))
-}
-
-fn fetch_text(url: &str) -> Result<String, String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(12))
-        .build();
-    agent
-        .get(url)
-        .set("User-Agent", "artifact-worker-generated-worker/0.1")
-        .call()
-        .map_err(|error| error.to_string())?
-        .into_string()
-        .map_err(|error| error.to_string())
-}
-
-fn source_url(payload: &Value) -> String {
-    if let Some(url) = payload_text(payload, &["url", "storyUrl", "postUrl"]) {
-        if let Some(url) = same_origin_url(&url) {
-            return url;
-        }
-    }
-    if let Some(id) = payload_text(payload, &["clusterUrlId", "clusterId", "id"]) {
-        if id.starts_with("http://") || id.starts_with("https://") {
-            return same_origin_url(&id).unwrap_or_else(|| SOURCE_URL.to_string());
-        }
-        return source_path(&id);
-    }
-    SOURCE_URL.to_string()
-}
-
-fn same_origin_url(url: &str) -> Option<String> {
-    let candidate = url.trim();
-    if candidate.is_empty() || candidate.starts_with("//") {
-        return None;
-    }
-    if !(candidate.starts_with("http://") || candidate.starts_with("https://")) {
-        return Some(source_path(candidate));
-    }
-    if origin(candidate).is_some() && origin(candidate) == origin(SOURCE_URL) {
-        Some(candidate.to_string())
-    } else {
-        None
-    }
-}
-
-fn source_path(path: &str) -> String {
-    let clean = path.trim();
-    if clean.is_empty() {
-        SOURCE_URL.to_string()
-    } else if clean.starts_with("http://") || clean.starts_with("https://") {
-        clean.to_string()
-    } else if clean.starts_with('/') {
-        let base = origin(SOURCE_URL).unwrap_or_else(|| SOURCE_URL.trim_end_matches('/').to_string());
-        format!("{}{}", base.trim_end_matches('/'), clean)
-    } else {
-        format!("{}/{}", SOURCE_URL.trim_end_matches('/'), clean.trim_start_matches('/'))
-    }
-}
-
-fn origin(url: &str) -> Option<String> {
-    let (scheme, rest) = url.split_once("://")?;
-    if scheme != "http" && scheme != "https" {
-        return None;
-    }
-    let authority = rest
-        .split(|ch| matches!(ch, '/' | '?' | '#'))
-        .next()?
-        .to_lowercase();
-    if authority.is_empty() || authority.contains('@') {
-        return None;
-    }
-    Some(format!("{}://{}", scheme.to_lowercase(), authority))
-}
-
-fn has_thread_payload(payload: &Value) -> bool {
-    payload.get("prompt").is_some()
-        || payload.get("reaction").is_some()
-        || payload.get("replies").and_then(Value::as_array).is_some()
-}
-
-fn format_thread_highlights(payload: &Value) -> String {
-    let subject = payload_text(payload, &["subject", "title"]).unwrap_or_else(|| SOURCE_NAME.into());
-    let thread_id = payload_text(payload, &["threadId", "clusterUrlId", "id"]).unwrap_or_else(|| "thread".into());
-    let mut out = format!("{} thread highlights ({}):\n\n", subject, thread_id);
-
-    if let Some(prompt) = payload.get("prompt") {
-        out.push_str(&format_named_quote("The prompt", prompt));
-        out.push('\n');
-    }
-    if let Some(reaction) = payload.get("reaction") {
-        out.push_str(&format_named_quote("Reaction", reaction));
-        out.push('\n');
-    }
-    if let Some(replies) = payload.get("replies").and_then(Value::as_array) {
-        if !replies.is_empty() {
-            out.push_str("Notable replies:\n\n");
-            for reply in replies {
-                out.push_str(&format_reply(reply));
-            }
-        }
-    }
-    if let Some(takeaway) = payload_text(payload, &["takeaway", "summary"]) {
-        out.push('\n');
-        out.push_str(&takeaway);
-    }
-    out.trim().to_string()
-}
-
-fn format_named_quote(label: &str, value: &Value) -> String {
-    let handle = value.get("handle").and_then(Value::as_str).unwrap_or("unknown");
-    let rank = value.get("rank").and_then(Value::as_i64).map(|rank| format!(", rank {rank}")).unwrap_or_default();
-    let text = value.get("text").and_then(Value::as_str).unwrap_or_default();
-    format!("{label} (@{handle}{rank}):\n\n| \"{}\"\n", text.trim())
-}
-
-fn format_reply(reply: &Value) -> String {
-    let handle = reply.get("handle").and_then(Value::as_str).unwrap_or("unknown");
-    let role = reply.get("role").and_then(Value::as_str).unwrap_or("source");
-    let rank = reply.get("rank").and_then(Value::as_i64).map(|rank| format!(", rank {rank}")).unwrap_or_default();
-    let mut out = format!("- @{handle} ({role}{rank})");
-    if let Some(text) = reply.get("text").and_then(Value::as_str) {
-        out.push_str(&format!(": \"{}\"\n", text.trim()));
-    } else {
-        out.push_str(":\n");
-    }
-    if let Some(points) = reply.get("points").and_then(Value::as_array) {
-        for point in points {
-            if let Some(point) = point.as_str() {
-                out.push_str(&format!("  - {}\n", point.trim()));
-            }
-        }
-    }
-    out
-}
-
-fn render_page_highlights(title: &str, summary: &str, links: &[Value], source: &str) -> String {
-    let mut out = format!("{title} highlights:\n\nSummary:\n\n| {summary}\n\n");
-    if !links.is_empty() {
-        out.push_str("Source links:\n\n");
-        for link in links {
-            let kind = link["kind"].as_str().unwrap_or("LINK");
-            let handle = link["handle"].as_str().unwrap_or("source");
-            let text = link["text"].as_str().unwrap_or_default();
-            out.push_str(&format!("- {kind} @{handle}: {text}"));
-            if let Some(url) = link.get("url").and_then(Value::as_str) {
-                if !url.is_empty() {
-                    out.push_str(&format!(" ({url})"));
-                }
-            }
-            out.push('\n');
-        }
-        out.push('\n');
-    }
-    out.push_str(&format!("Source: {source}"));
-    out
-}
-
-fn readable_text(html: &str) -> String {
-    let mut lines = flight_text_values(html);
-    for line in clean_lines(&html_to_text(html)) {
-        if useful_page_value(&line) {
-            dedup_push(&mut lines, line);
-        }
-    }
-    lines.join("\n")
-}
-
-fn flight_text_values(html: &str) -> Vec<String> {
-    let decoded = decode_entities(html);
-    let mut values = Vec::new();
-    for marker in ["\\\\\\\"children\\\\\\\":\\\\\\\"", "\\\"children\\\":\\\"", "\"children\":\""] {
-        let mut rest = decoded.as_str();
-        while let Some(index) = rest.find(marker) {
-            rest = &rest[index + marker.len()..];
-            if let Some((value, next)) = marker_value(rest) {
-                if useful_page_value(&value) {
-                    dedup_push(&mut values, value);
-                }
-                rest = next;
-            } else {
-                break;
-            }
-        }
-    }
-    values
-}
-
-fn marker_value(rest: &str) -> Option<(String, &str)> {
-    let escaped_end = rest.find("\\\\\\\"");
-    let quoted_end = rest.find('"');
-    let end = match (escaped_end, quoted_end) {
-        (Some(left), Some(right)) => left.min(right),
-        (Some(left), None) => left,
-        (None, Some(right)) => right,
-        (None, None) => return None,
-    };
-    let raw = &rest[..end];
-    let value = compact_value(&decode_js_value(raw));
-    let next = &rest[end.saturating_add(1)..];
-    Some((value, next))
-}
-
-fn decode_js_value(value: &str) -> String {
-    value
-        .replace("\\\\n", " ")
-        .replace("\\\\r", " ")
-        .replace("\\\\t", " ")
-        .replace("\\\\\\\"", "\"")
-        .replace("\\\\\\\\", "\\")
-}
-
-fn useful_page_value(value: &str) -> bool {
-    let value = value.trim();
-    let lower = value.to_lowercase();
-    let code_punctuation = value
-        .chars()
-        .filter(|ch| matches!(ch, '{' | '}' | '=' | ';'))
-        .count();
-    value.len() >= 3
-        && value.len() <= 320
-        && code_punctuation == 0
-        && !value.contains("self.__next_f.push")
-        && !value.contains("className")
-        && !value.contains("function")
-        && !value.contains("children")
-        && !value.contains("href")
-        && !value.contains("xmlns")
-        && !value.contains("viewBox")
-        && !value.contains("lucide")
-        && !value.contains("webpack")
-        && !value.contains("__next")
-        && !value.contains("Symbol(")
-        && !value.contains("=>")
-        && !lower.contains("return ")
-        && !lower.contains("use client")
-        && !value.contains("},{")
-        && !lower.starts_with("var ")
-        && !lower.starts_with("let ")
-        && !lower.starts_with("const ")
-        && !lower.starts_with("window.")
-        && !lower.starts_with(SOURCE_NAME)
-        && !lower.contains("terms of service")
-        && !lower.contains("privacy policy")
-        && !lower.contains("cookie policy")
-        && !lower.contains(" · ")
-        && !["ai", "post", "reply", "quote", "share", "copy", "open", "close", "menu", "loading"]
-            .contains(&lower.as_str())
-}
-
-fn compact_value(value: &str) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    compact
-        .split(" · ")
-        .next()
-        .unwrap_or(&compact)
-        .trim_matches('\\')
-        .trim()
-        .to_string()
-}
-
-fn dedup_push(values: &mut Vec<String>, value: String) {
-    let value = value.trim().to_string();
-    if value.is_empty() {
-        return;
-    }
-    if !values.iter().any(|existing| existing.eq_ignore_ascii_case(&value)) {
-        values.push(value);
-    }
-}
-
-fn extract_items(text: &str, limit: usize) -> Vec<Value> {
-    let lines = clean_lines(text);
-    let mut items = Vec::new();
-    for index in 0..lines.len() {
-        let line = &lines[index];
-        if !looks_like_title(line) {
-            continue;
-        }
-        let summary = lines
-            .iter()
-            .skip(index + 1)
-            .find(|candidate| candidate.len() > 70 && !looks_like_metric_line(candidate))
-            .cloned()
-            .unwrap_or_default();
-        items.push(serde_json::json!({
-            "rank": items.len() + 1,
-            "title": line,
-            "summary": summary
-        }));
-        if items.len() >= limit {
-            break;
-        }
-    }
-    items
-}
-
-fn extract_action_lines(text: &str, limit: usize) -> Vec<Value> {
-    clean_lines(text)
-        .into_iter()
-        .filter_map(|line| parse_action_line(&line))
-        .take(limit)
-        .collect()
-}
-
-fn extract_source_links(html: &str, limit: usize) -> Vec<Value> {
-    let decoded = decode_entities(html);
-    let mut links = Vec::new();
-    let mut rest = decoded.as_str();
-    while let Some(index) = rest.find("https://") {
-        rest = &rest[index..];
-        let Some((url, next)) = read_url(rest) else {
-            break;
-        };
-        rest = next;
-        if let Some(handle) = handle_from_url(&url) {
-            if links.iter().any(|link: &Value| link["url"].as_str() == Some(url.as_str())) {
-                continue;
-            }
-            links.push(serde_json::json!({
-                "kind": "LINK",
-                "handle": handle,
-                "text": "source link",
-                "url": url
-            }));
-            if links.len() >= limit {
-                break;
-            }
-        }
-    }
-    links
-}
-
-fn read_url(value: &str) -> Option<(String, &str)> {
-    let end = value
-        .char_indices()
-        .find(|(_, ch)| ch.is_whitespace() || *ch == '"' || *ch == '\'' || *ch == '<' || *ch == '\\')
-        .map(|(index, _)| index)
-        .unwrap_or(value.len());
-    if end == 0 {
-        return None;
-    }
-    Some((value[..end].trim_end_matches('/').to_string(), &value[end..]))
-}
-
-fn handle_from_url(url: &str) -> Option<String> {
-    let rest = url
-        .strip_prefix("https://x.com/")
-        .or_else(|| url.strip_prefix("https://twitter.com/"))
-        .or_else(|| url.strip_prefix("https://github.com/"))?;
-    if rest.contains("intent/") || rest.contains("share") {
-        return None;
-    }
-    let handle = rest.split('/').next()?.trim();
-    if handle.is_empty() || handle == "i" {
-        None
-    } else {
-        Some(handle.to_string())
-    }
-}
-
-fn parse_action_line(line: &str) -> Option<Value> {
-    let mut parts = line.splitn(2, '@');
-    let prefix = parts.next()?.trim();
-    let rest = parts.next()?.trim();
-    if !(prefix.contains("POST") || prefix.contains("REPLY") || prefix.contains("QUOTE")) {
-        return None;
-    }
-    let handle = rest.split_whitespace().next().unwrap_or("unknown").trim_matches(':');
-    let rank = prefix
-        .split('#')
-        .nth(1)
-        .map(|value| value.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "?".into());
-    let text = rest
-        .split_once(handle)
-        .map(|(_, value)| value.trim())
-        .unwrap_or_default()
-        .to_string();
-    Some(serde_json::json!({
-        "kind": prefix.split_whitespace().next().unwrap_or("ACTION"),
-        "handle": handle.trim_start_matches('@'),
-        "rank": rank,
-        "text": text
-    }))
-}
-
-fn first_item_title(text: &str) -> Option<String> {
-    clean_lines(text)
-        .into_iter()
-        .find(|line| looks_like_title(line))
-}
-
-fn first_long_paragraph(text: &str, title: &str) -> Option<String> {
-    clean_lines(text)
-        .into_iter()
-        .filter(|line| line != title)
-        .find(|line| line.len() > 90 && !looks_like_metric_line(line))
-}
-
-fn find_matching_line(text: &str, query: &str) -> Option<String> {
-    let query = query.to_lowercase();
-    let query_empty = query.is_empty();
-    clean_lines(text).into_iter().find(|line| {
-        let lower = line.to_lowercase();
-        if query_empty {
-            line.starts_with('#') || lower.contains("rank")
-        } else {
-            lower.contains(&query)
-        }
-    })
-}
-
-fn clean_lines(text: &str) -> Vec<String> {
-    text.lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
-        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|line| useful_page_value(line))
-        .collect()
-}
-
-fn looks_like_title(line: &str) -> bool {
-    let lower = line.to_lowercase();
-    let word_count = line.split_whitespace().count();
-    line.len() > 12
-        && line.len() < 180
-        && word_count >= 3
-        && !line.contains('%')
-        && !line.contains("Posts:")
-        && !line.contains("Clusters:")
-        && !line.contains("followers")
-        && !line.contains("Terms")
-        && !line.contains("Privacy")
-        && !lower.contains("fresh stories")
-        && !lower.contains("clustering")
-        && !lower.contains("complete")
-        && !line.eq_ignore_ascii_case("IN CASE YOU MISSED IT")
-        && line.chars().any(|ch| ch.is_ascii_lowercase())
-        && !line.ends_with(':')
-        && !looks_like_metric_line(line)
-}
-
-fn looks_like_metric_line(line: &str) -> bool {
-    line.chars().any(|c| c.is_ascii_digit())
-        && (line.contains('k') || line.contains('M') || line.contains("h "))
-        && line.split_whitespace().count() <= 8
-}
-
-fn html_to_text(html: &str) -> String {
-    let mut out = String::new();
-    let mut in_tag = false;
-    for ch in html.chars() {
-        match ch {
-            '<' => {
-                in_tag = true;
-                out.push('\n');
-            }
-            '>' => {
-                in_tag = false;
-                out.push('\n');
-            }
-            _ if !in_tag => out.push(ch),
-            _ => {}
-        }
-    }
-    decode_entities(&out)
-}
-
-fn decode_entities(value: &str) -> String {
-    value
-        .replace("&quot;", "\"")
-        .replace("&#x27;", "'")
-        .replace("&#39;", "'")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&nbsp;", " ")
-}
-
-fn payload_text(payload: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .filter_map(|key| payload.get(*key).and_then(Value::as_str))
-        .map(str::trim)
-        .find(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn payload_number(payload: &Value, key: &str) -> Option<i64> {
-    payload.get(key).and_then(Value::as_i64)
-}
-"#
-    .replace("__WORKER_NAME__", &plan.worker_name)
-    .replace("__REGISTRATIONS__", &registrations)
-    .replace("__SOURCE_URL__", &source_url)
-    .replace("__SOURCE_NAME__", &source_name)
-}
-
-fn render_worker_cargo(plan: &WorkerPlan) -> String {
-    let http_deps = if uses_live_http_template(plan) {
-        r#"ureq = { version = "2.12", default-features = false, features = ["tls"] }
-"#
-    } else {
-        ""
-    };
-
-    format!(
-        r#"[package]
-name = "{}"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-anyhow = "1.0"
-iii-sdk = "0.11.6"
-schemars = "0.8"
-serde = {{ version = "1.0", features = ["derive"] }}
-serde_json = "1.0"
-{http_deps}
-"#,
-        plan.worker_name,
-        http_deps = http_deps
-    )
-}
-
-fn render_worker_readme(plan: &WorkerPlan) -> String {
-    let functions = plan
-        .functions
-        .iter()
-        .map(|function| format!("- `{}` — {}", function.function_id, function.purpose))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let reuse = render_reuse_markdown(plan);
-    format!(
-        "# {}\n\nGenerated by Artifact as a narrow Rust iii worker.\n\n## Goal\n\n{}\n\n## Functions\n\n{}\n\n## Reused iii Workers\n\n{}\n",
-        plan.worker_name, plan.goal, functions, reuse
-    )
-}
-
-fn render_reuse_markdown(plan: &WorkerPlan) -> String {
-    let rows = plan
-        .reuse_plan
-        .engine_builtins
-        .iter()
-        .chain(plan.reuse_plan.installable_workers.iter())
-        .map(|worker| {
-            let install = worker.install.as_deref().unwrap_or("built into iii engine");
-            format!(
-                "| `{}` | {} | {} | `{}` |",
-                worker.name, worker.source, worker.purpose, install
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    if rows.is_empty() {
-        "No reusable iii workers selected.".into()
-    } else {
-        format!(
-            "| Worker | Source | Why | Install |\n|---|---|---|---|\n{}",
-            rows
-        )
-    }
-}
-
-fn render_worker_yaml(plan: &WorkerPlan) -> String {
-    let functions = plan
-        .functions
-        .iter()
-        .map(|function| {
-            format!(
-                "  - id: {}\n    sideEffects: {}\n",
-                function.function_id,
-                side_effects_label(&function.side_effects)
-            )
-        })
-        .collect::<String>();
-    let dependencies = plan
-        .reuse_plan
-        .installable_workers
-        .iter()
-        .map(|worker| {
-            format!(
-                "  - name: {}\n    source: {}\n    install: {}\n",
-                worker.name,
-                worker.source,
-                worker.install.as_deref().unwrap_or("iii worker add")
-            )
-        })
-        .collect::<String>();
-    let dependencies = if dependencies.is_empty() {
-        "[]\n".into()
-    } else {
-        format!("\n{}", dependencies)
-    };
-
-    format!(
-        "name: {}\nversion: 0.1.0\nruntime: rust\ndescription: Narrow artifact worker generated by Artifact.\nfunctions:\n{}dependencies: {}",
-        plan.worker_name, functions, dependencies
-    )
-}
-
-fn side_effects_label(side_effects: &SideEffects) -> &'static str {
-    match side_effects {
-        SideEffects::Read => "read",
-        SideEffects::Write => "write",
-        SideEffects::Sync => "sync",
-        SideEffects::ExternalCall => "external-call",
-    }
-}
-
-fn json_string_array(values: &[String]) -> String {
-    let values = values
-        .iter()
-        .map(|value| {
-            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-            format!("\"{}\"", escaped)
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("[{}]", values)
-}
-
-fn canonical_source_name(value: &str) -> String {
-    let compact = value
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-    match compact.as_str() {
-        "hn" | "hackernews" => "hackernews".into(),
-        "producthunt" => "producthunt".into(),
-        "" => "source".into(),
-        _ => compact,
-    }
 }
 
 fn slugify(value: &str) -> String {
@@ -2744,17 +1606,56 @@ fn slugify(value: &str) -> String {
     }
 }
 
-fn titleize(value: &str) -> String {
-    value
-        .split('_')
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+fn join_url_path(base: &str, path: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let path = path.trim();
+    if path.is_empty() {
+        base.to_string()
+    } else if path.starts_with('/') {
+        format!("{base}{path}")
+    } else {
+        format!("{base}/{path}")
+    }
+}
+
+fn url_origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?.to_lowercase();
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    Some(format!("{}://{}", scheme.to_lowercase(), authority))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_virtual_function_does_not_duplicate_path_params_in_query() {
+        let function = VirtualHttpFunction {
+            function_id: "demo::get_story".into(),
+            url: "http://127.0.0.1:18089/stories/{id}".into(),
+            method: HttpMethod::Get,
+            mcp_transport: None,
+            invocation: VirtualInvocation::Http,
+            description: "Get story".into(),
+            request_format: None,
+            response_format: None,
+            metadata: Value::Null,
+        };
+
+        let url = virtual_function_url(
+            &function,
+            &serde_json::json!({
+                "id": "42",
+                "include": "comments"
+            }),
+        );
+
+        assert_eq!(url, "http://127.0.0.1:18089/stories/42?include=comments");
+    }
 }

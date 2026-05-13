@@ -1,44 +1,48 @@
-# Research note: narrow Rust workers over broad wrappers
+# Research note: automatic OpenAPI and MCP conversion
 
-Artifact starts from a simple observation: agents waste context when every integration is exposed as a broad wrapper. The better unit is a narrow Rust worker that owns a specific job, registers a few stable iii functions, and reuses the iii platform for everything that is already solved.
+Artifact should behave like an iii worker, not a local code generator.
 
-## Narrow worker pattern
+The core path is:
 
 ```text
-source artifact + job definition
-  -> function plan
-  -> reuse plan
-  -> generated Rust worker scaffold
-  -> verification report
-  -> iii registry
+OpenAPI or MCP input
+  -> artifact::convert
+  -> discovered operations/tools
+  -> engine HTTP-invoked iii functions
+  -> normal iii trigger calls from any worker
 ```
 
-## Existing iii surfaces to compose with
+## Product rule
 
-Engine builtins from `iii-hq/iii`:
+The public surface is one function: `artifact::convert`.
 
-- `iii-state` for manifests, fingerprints, generated worker state, and caches
-- `iii-queue` for async generation, verification, sync, and publish jobs
-- `iii-cron` for scheduled refresh
-- `iii-rest` for HTTP triggers
-- `iii-stream` for generation progress and runtime events
-- `iii-sandbox` for isolated build, test, and execution
-- `iii-observability` for traces, logs, rollups, and alerts
+Do not ask users to pick from prewritten integrations, edit generated files, or run a separate local CLI before they can call the result. For OpenAPI and MCP inputs, conversion should happen by discovery and registration.
 
-Installable workers from `iii-hq/workers`:
+## Engine rule
 
-- `auth-credentials` for API keys and OAuth tokens
-- `shell-bash` for sandboxed CLI, git, build, and smoke-test commands
-- `shell-filesystem` for artifact ingestion and generated file operations
-- `iii-database` for SQLite/Postgres/MySQL mirrors and query polling
-- `mcp` and `skills` for agent-facing tool/resource exposure
-- `proof` for browser verification
-- model/provider/session/hook/policy workers when the generated worker needs assistant routing or guardrails
+Artifact registers each discovered operation/tool through the engine HTTP invocation path. The internal grouping hint lives under `metadata.iii.virtualWorker`; the engine consumes and strips that hint before public function listing.
 
-## Design rule
+Users, workers, and agents should only see ordinary function ids such as:
 
-Generate the Rust worker the agent needs, not the entire API surface the provider exposes.
+- `xkcd_live::get_comicid_info_0_json`
+- `context7_stdio::query_docs`
+- `docs_mcp::search_docs`
 
-## Reuse rule
+They should not need to know that those functions came from an internal grouped registration.
 
-If a capability is already in `iii-hq/iii` or `iii-hq/workers`, Artifact should record it in the plan and generated manifest instead of generating duplicate code.
+## Scope now
+
+Supported:
+
+- OpenAPI JSON and YAML
+- MCP over HTTP
+- MCP over stdio
+- duplicate conversion replacement
+- public metadata without internal `iii` fields
+- hidden internal grouping in `engine::workers::list`
+
+Not done yet:
+
+- auth handoff for protected OpenAPI endpoints
+- write-safety policy for mutating API operations
+- full registry packaging after the paired engine change lands

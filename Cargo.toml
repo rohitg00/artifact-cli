@@ -2,7 +2,7 @@
 name = "artifact-worker"
 version = "0.1.0"
 edition = "2021"
-description = "Turn MCP servers, APIs, specs, docs, and workflow artifacts into narrowly scoped iii workers."
+description = "Convert OpenAPI specs and MCP servers into triggerable iii functions."
 license = "MIT"
 repository = "https://github.com/iii-experimental/artifact-worker"
 
@@ -14,10 +14,6 @@ path = "src/lib.rs"
 name = "artifact-worker"
 path = "src/bin/artifact-worker.rs"
 
-[[bin]]
-name = "artifact"
-path = "src/bin/artifact.rs"
-
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -25,7 +21,9 @@ iii-sdk = "0.11.6"
 schemars = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yml = "0.0.12"
 thiserror = "2.0"
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
 
 [dev-dependencies]
 tempfile = "3.14"

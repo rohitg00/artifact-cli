@@ -1,291 +1,11 @@
 use artifact_worker::{
-    artifact_manifest, convert_artifact, generate_worker, inspect_artifact, install_plan,
-    plan_worker, registered_function_ids, verify_worker, worker_catalog, worker_metadata,
-    worker_recipes, ArtifactError, ArtifactInput, ConvertArtifactInput, RecipeStage, SourceType,
-    VerifyWorkerInput,
+    convert_artifact_for_iii, registered_function_ids, worker_metadata, ArtifactError,
+    ConvertArtifactInput, SourceType,
 };
 
 #[test]
-fn plans_narrow_worker_functions_from_explicit_artifact_input() {
-    let input = ArtifactInput {
-        name: "hackernews".into(),
-        goal: Some("give agents focused access to top stories and item lookup".into()),
-        source_type: Some(SourceType::Docs),
-        source: Some("https://github.com/HackerNews/API".into()),
-        functions: vec![
-            "top_stories".into(),
-            "get_item".into(),
-            "search_cached_stories".into(),
-        ],
-        output_dir: None,
-    };
-
-    let plan = plan_worker(input.clone()).unwrap();
-
-    assert_eq!(plan.worker_name, "hackernews-worker");
-    assert_eq!(plan.namespace, "hackernews");
-    assert_eq!(plan.functions.len(), 3);
-    assert_eq!(plan.functions[0].function_id, "hackernews::top_stories");
-    assert!(plan.uses_workers.contains(&"iii-sandbox".to_string()));
-    assert!(plan.uses_workers.contains(&"iii-database".to_string()));
-    assert!(plan
-        .reuse_plan
-        .installable_workers
-        .iter()
-        .any(|worker| worker.name == "mcp"));
-}
-
-#[test]
-fn classifies_function_intents_on_tokens_not_substrings() {
-    let input = ArtifactInput {
-        name: "producthunt".into(),
-        goal: Some("daily launch tracking and maker lookup".into()),
-        source_type: Some(SourceType::Docs),
-        source: Some("https://www.producthunt.com".into()),
-        functions: vec![
-            "top_launches".into(),
-            "launch_details".into(),
-            "launch_metrics".into(),
-            "maker_lookup".into(),
-        ],
-        output_dir: None,
-    };
-
-    let plan = plan_worker(input).unwrap();
-    let purpose = |id: &str| {
-        plan.functions
-            .iter()
-            .find(|function| function.function_id == id)
-            .map(|function| function.purpose.as_str())
-            .unwrap()
-    };
-
-    assert!(purpose("producthunt::top_launches").starts_with("Return top"));
-    assert!(purpose("producthunt::launch_details").starts_with("Look up"));
-    assert!(purpose("producthunt::launch_metrics").starts_with("Read"));
-    assert!(purpose("producthunt::maker_lookup").starts_with("Look up"));
-}
-
-#[test]
-fn inspect_artifact_recommends_narrow_not_generic_wrapper() {
-    let input = ArtifactInput {
-        name: "github repo".into(),
-        goal: Some("repo and pull request risk checks".into()),
-        source_type: Some(SourceType::OpenApi),
-        source: None,
-        functions: vec![],
-        output_dir: None,
-    };
-
-    let inspected = inspect_artifact(input).unwrap();
-
-    assert_eq!(inspected.namespace, "github_repo");
-    assert!(inspected.recommendation.contains("narrow iii worker"));
-    assert!(inspected
-        .suggested_functions
-        .iter()
-        .any(|id| id == "github_repo::stale_prs"));
-    assert!(inspected
-        .reuse_plan
-        .installable_workers
-        .iter()
-        .any(|worker| worker.name == "auth-credentials"));
-}
-
-#[test]
-fn infers_hackernews_functions_from_name_before_source_url_noise() {
-    let input = ArtifactInput {
-        name: "hackernews".into(),
-        goal: Some("give agents focused access to top stories and item lookup".into()),
-        source_type: Some(SourceType::Docs),
-        source: Some("https://github.com/HackerNews/API".into()),
-        functions: vec![],
-        output_dir: None,
-    };
-
-    let plan = plan_worker(input).unwrap();
-
-    assert_eq!(plan.functions[0].function_id, "hackernews::top_stories");
-    assert!(plan
-        .functions
-        .iter()
-        .any(|function| function.function_id == "hackernews::get_item"));
-}
-
-#[test]
-fn generated_hackernews_alias_uses_specialized_handler() {
-    let tmp = tempfile::tempdir().unwrap();
-    let input = ArtifactInput {
-        name: "hacker_news".into(),
-        goal: Some("give agents focused access to top stories and item lookup".into()),
-        source_type: Some(SourceType::Docs),
-        source: Some("https://github.com/HackerNews/API".into()),
-        functions: vec!["top_stories".into(), "get_item".into()],
-        output_dir: Some(tmp.path().to_path_buf()),
-    };
-
-    let generated = generate_worker(input).unwrap();
-    let worker_source = std::fs::read_to_string(&generated.worker_path).unwrap();
-    assert!(worker_source.contains("const SOURCE_NAME: &str = \"hackernews\";"));
-    assert!(worker_source.contains("if SOURCE_NAME == \"hackernews\""));
-    assert!(worker_source.contains("handle_hackernews_function"));
-}
-
-#[test]
-fn infers_narrow_digg_worker_from_artifact_source() {
-    let input = ArtifactInput {
-        name: "digg".into(),
-        goal: Some("rank lookup, top stories, story highlights, and pipeline status".into()),
-        source_type: Some(SourceType::Docs),
-        source: Some("https://di.gg/ai".into()),
-        functions: vec![],
-        output_dir: None,
-    };
-
-    let plan = plan_worker(input).unwrap();
-
-    assert_eq!(plan.worker_name, "digg-worker");
-    assert_eq!(plan.functions.len(), 5);
-    assert!(plan
-        .functions
-        .iter()
-        .any(|function| function.function_id == "digg::author_rank"
-            && function.purpose.contains("Look up a person")));
-    assert!(plan
-        .functions
-        .iter()
-        .any(|function| function.function_id == "digg::pipeline_status"));
-    assert!(plan.uses_workers.contains(&"iii-database".to_string()));
-    assert!(plan.uses_workers.contains(&"iii-rest".to_string()));
-    assert!(!plan.uses_workers.contains(&"auth-credentials".to_string()));
-}
-
-#[test]
-fn recipe_catalog_seeds_core_worker_targets() {
-    let recipes = worker_recipes();
-
-    for name in [
-        "digg",
-        "hackernews",
-        "producthunt",
-        "linear",
-        "github_repo",
-        "stripe",
-        "arxiv",
-        "wikipedia",
-        "sentry",
-        "slack",
-        "notion",
-        "openrouter",
-    ] {
-        assert!(recipes.iter().any(|recipe| recipe.name == name), "{name}");
-    }
-}
-
-#[test]
-fn recipe_catalog_is_prioritized_by_readiness() {
-    let recipes = worker_recipes();
-    let hackernews = recipes
-        .iter()
-        .find(|recipe| recipe.name == "hackernews")
-        .unwrap();
-    assert_eq!(hackernews.stage, RecipeStage::BuildNow);
-    assert!(hackernews.priority >= 90);
-    assert!(hackernews.integration.contains("public read-only"));
-    assert!(hackernews
-        .research_links
-        .iter()
-        .any(|link| link == "https://github.com/HackerNews/API"));
-
-    let producthunt = recipes
-        .iter()
-        .find(|recipe| recipe.name == "producthunt")
-        .unwrap();
-    assert_eq!(producthunt.stage, RecipeStage::ResearchFirst);
-    assert!(producthunt.integration.contains("GraphQL"));
-    assert!(producthunt.rationale.contains("research"));
-
-    let linear = recipes
-        .iter()
-        .find(|recipe| recipe.name == "linear")
-        .unwrap();
-    assert_eq!(linear.stage, RecipeStage::ResearchFirst);
-    assert!(linear
-        .research_links
-        .iter()
-        .any(|link| link == "https://linear.app/docs/api/"));
-}
-
-#[test]
-fn infers_producthunt_and_linear_from_recipe_catalog() {
-    let producthunt = plan_worker(ArtifactInput {
-        name: "producthunt".into(),
-        goal: Some("daily launch tracking and maker lookup".into()),
-        source_type: Some(SourceType::Docs),
-        source: Some("https://www.producthunt.com".into()),
-        functions: vec![],
-        output_dir: None,
-    })
-    .unwrap();
-    assert!(producthunt
-        .functions
-        .iter()
-        .any(|function| function.function_id == "producthunt::launch_metrics"));
-
-    let linear = plan_worker(ArtifactInput {
-        name: "linear".into(),
-        goal: Some("blocked issues and cycle risk".into()),
-        source_type: Some(SourceType::OpenApi),
-        source: Some("https://linear.app".into()),
-        functions: vec![],
-        output_dir: None,
-    })
-    .unwrap();
-    assert!(linear
-        .functions
-        .iter()
-        .any(|function| function.function_id == "linear::cycle_risk"));
-}
-
-#[test]
-fn manifest_matches_artifact_worker_manifest_function_surface() {
-    let input = ArtifactInput {
-        name: "hackernews".into(),
-        goal: Some("focused agent access to top stories".into()),
-        source_type: Some(SourceType::Docs),
-        source: Some("https://github.com/HackerNews/API".into()),
-        functions: vec!["top_stories".into(), "get_item".into()],
-        output_dir: None,
-    };
-
-    let manifest = artifact_manifest(input).unwrap();
-
-    assert_eq!(manifest.schema, "artifact-worker.manifest.preview.v1");
-    assert_eq!(manifest.worker_name, "hackernews-worker");
-    assert_eq!(manifest.functions.len(), 2);
-    assert!(manifest.uses_workers.contains(&"iii-sandbox".to_string()));
-    assert!(manifest
-        .reuse_plan
-        .engine_builtins
-        .iter()
-        .any(|worker| worker.name == "iii-state"));
-}
-
-#[test]
-fn exposes_the_same_artifact_function_ids_as_iii_primitives() {
-    assert_eq!(
-        registered_function_ids(),
-        vec![
-            "artifact::catalog",
-            "artifact::recipes",
-            "artifact::inspect",
-            "artifact::plan_worker",
-            "artifact::convert",
-            "artifact::generate_worker",
-            "artifact::verify_worker",
-            "artifact::manifest",
-        ]
-    );
+fn exposes_only_convert_as_public_worker_surface() {
+    assert_eq!(registered_function_ids(), vec!["artifact::convert"]);
 
     let metadata = worker_metadata();
     assert_eq!(metadata.runtime, "rust");
@@ -293,241 +13,496 @@ fn exposes_the_same_artifact_function_ids_as_iii_primitives() {
 }
 
 #[test]
-fn convert_artifact_accepts_mcp_url_payload_and_generates_worker() {
-    let tmp = tempfile::tempdir().unwrap();
-    let generated = convert_artifact(ConvertArtifactInput {
-        name: Some("github mcp".into()),
-        goal: Some("Expose selected MCP tools as stable HTTP-invokable iii functions.".into()),
-        source_type: Some(SourceType::Mcp),
-        source: Some("https://example.com/mcp".into()),
-        functions: vec!["search_repos".into(), "get_issue".into()],
-        output_dir: Some(tmp.path().to_path_buf()),
-    })
-    .unwrap();
+fn convert_rejects_blank_source_before_any_registration() {
+    let iii = iii_sdk::register_worker("ws://localhost:1", artifact_worker::init_options());
 
-    assert!(generated.worker_path.ends_with("src/main.rs"));
-    assert_eq!(generated.plan.namespace, "github_mcp");
-    assert_eq!(generated.plan.source_type, SourceType::Mcp);
-    assert!(generated.plan.uses_workers.contains(&"mcp".to_string()));
-    assert!(generated
-        .plan
-        .uses_workers
-        .contains(&"iii-rest".to_string()));
-
-    let manifest = std::fs::read_to_string(&generated.manifest_path).unwrap();
-    assert!(manifest.contains("\"sourceType\": \"mcp\""));
-    assert!(manifest.contains("\"github_mcp::search_repos\""));
-    assert!(manifest.contains("\"github_mcp::get_issue\""));
-}
-
-#[test]
-fn convert_artifact_infers_name_from_url_payload() {
-    let tmp = tempfile::tempdir().unwrap();
-    let generated = convert_artifact(ConvertArtifactInput {
-        source: Some("https://github.com/HackerNews/API".into()),
-        goal: Some("top stories and item lookup".into()),
-        output_dir: Some(tmp.path().to_path_buf()),
-        ..Default::default()
-    })
-    .unwrap();
-
-    assert_eq!(generated.plan.namespace, "hackernews");
-    assert_eq!(generated.plan.source_type, SourceType::Url);
-    assert!(generated
-        .plan
-        .functions
-        .iter()
-        .any(|function| function.function_id == "hackernews::top_stories"));
-}
-
-#[test]
-fn convert_artifact_trims_source_before_inference_and_output() {
-    let tmp = tempfile::tempdir().unwrap();
-    let generated = convert_artifact(ConvertArtifactInput {
-        source: Some("  https://github.com/HackerNews/API\n".into()),
-        goal: Some("top stories and item lookup".into()),
-        output_dir: Some(tmp.path().to_path_buf()),
-        ..Default::default()
-    })
-    .unwrap();
-
-    assert_eq!(
-        generated.plan.source.as_deref(),
-        Some("https://github.com/HackerNews/API")
-    );
-    assert_eq!(generated.plan.namespace, "hackernews");
-    assert_eq!(generated.plan.source_type, SourceType::Url);
-}
-
-#[test]
-fn convert_artifact_rejects_explicit_blank_source() {
-    let error = convert_artifact(ConvertArtifactInput {
-        name: Some("manual".into()),
-        source: Some(" \n\t ".into()),
-        ..Default::default()
-    })
+    let error = convert_artifact_for_iii(
+        &iii,
+        ConvertArtifactInput {
+            name: Some("blank".into()),
+            source: Some(" \n\t ".into()),
+            ..Default::default()
+        },
+    )
     .unwrap_err();
+    iii.shutdown();
 
     assert!(matches!(error, ArtifactError::InvalidInput(_)));
     assert!(error.to_string().contains("source/url cannot be blank"));
 }
 
 #[test]
-fn catalog_exposes_engine_builtins_and_installable_workers() {
-    let catalog = worker_catalog();
+fn convert_rejects_non_openapi_non_mcp_sources() {
+    let iii = iii_sdk::register_worker("ws://localhost:1", artifact_worker::init_options());
 
-    assert!(catalog
-        .engine_builtins
-        .iter()
-        .any(|worker| worker.name == "iii-state"));
-    assert!(catalog
-        .installable_workers
-        .iter()
-        .any(|worker| worker.name == "shell-bash"
-            && worker.functions.contains(&"shell::bash::exec".to_string())));
-    assert!(catalog
-        .installable_workers
-        .iter()
-        .any(|worker| worker.name == "iii-database"
-            && worker.install.as_deref() == Some("iii worker add iii-database")));
+    let error = convert_artifact_for_iii(
+        &iii,
+        ConvertArtifactInput {
+            name: Some("plain url".into()),
+            source_type: Some(SourceType::Url),
+            source: Some("https://example.com".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    iii.shutdown();
+
+    assert!(matches!(error, ArtifactError::InvalidInput(_)));
+    assert!(error
+        .to_string()
+        .contains("supports open_api and mcp sources"));
 }
 
 #[test]
-fn generates_and_verifies_rust_worker_scaffold_using_iii_sdk_apis() {
+fn convert_registers_openapi_json_as_http_invoked_functions() {
     let tmp = tempfile::tempdir().unwrap();
-    let input = ArtifactInput {
-        name: "hackernews".into(),
-        goal: Some("focused agent access to top stories".into()),
-        source_type: Some(SourceType::Docs),
-        source: Some("https://github.com/HackerNews/API".into()),
-        functions: vec!["top_stories".into(), "get_item".into()],
-        output_dir: Some(tmp.path().to_path_buf()),
-    };
-
-    let generated = generate_worker(input).unwrap();
-    assert!(generated.worker_path.ends_with("src/main.rs"));
-    assert!(generated.manifest_path.ends_with("artifact.manifest.json"));
-    assert!(tmp.path().join("iii.worker.yaml").exists());
-
-    let worker_source = std::fs::read_to_string(&generated.worker_path).unwrap();
-    assert!(worker_source.contains("use iii_sdk::{register_worker, InitOptions, RegisterFunction"));
-    assert!(worker_source.contains("iii.register_function(RegisterFunction::new"));
-    assert!(!worker_source.contains("// iii.register_function"));
-    assert!(!worker_source.contains("//!"));
-    assert!(worker_source.contains("\"reusedWorkers\""));
-
-    let worker_yaml = std::fs::read_to_string(tmp.path().join("iii.worker.yaml")).unwrap();
-    assert!(worker_yaml.contains("dependencies:"));
-    assert!(worker_yaml.contains("iii worker add shell-filesystem"));
-    assert!(worker_yaml.contains("iii worker add mcp"));
-
-    let worker_readme = std::fs::read_to_string(tmp.path().join("README.md")).unwrap();
-    assert!(worker_readme.contains("Reused iii Workers"));
-    assert!(worker_readme.contains("iii-hq/workers"));
-
-    let verified = verify_worker(VerifyWorkerInput {
-        output_dir: tmp.path().to_path_buf(),
-    })
-    .unwrap();
-    assert!(verified.ok, "missing: {:?}", verified.missing_registrations);
-    assert_eq!(verified.function_count, 2);
-    assert!(verified.missing_files.is_empty());
-
-    let install = install_plan(tmp.path()).unwrap();
-    assert!(install.ok);
-    assert_eq!(install.worker_name, "hackernews-worker");
-    assert!(install
-        .commands
-        .iter()
-        .any(|command| command == "iii worker add shell-filesystem"));
-    assert!(install
-        .commands
-        .iter()
-        .any(|command| command.contains("cargo build --release")));
-}
-
-#[test]
-fn generated_digg_worker_uses_generic_live_source_template() {
-    let tmp = tempfile::tempdir().unwrap();
-    let input = ArtifactInput {
-        name: "digg".into(),
-        goal: Some("focused Digg AI story highlights".into()),
-        source_type: Some(SourceType::Docs),
-        source: Some("https://di.gg/ai".into()),
-        functions: vec!["story_highlights".into(), "top_stories".into()],
-        output_dir: Some(tmp.path().to_path_buf()),
-    };
-
-    let generated = generate_worker(input).unwrap();
-    let worker_source = std::fs::read_to_string(&generated.worker_path).unwrap();
-    assert!(worker_source.contains("handle_source_function"));
-    assert!(worker_source.contains("format_thread_highlights"));
-    assert!(worker_source.contains("readable_text"));
-    assert!(worker_source.contains("extract_source_links"));
-    assert!(worker_source.contains("fetch_text"));
-    assert!(worker_source.contains("SOURCE_URL"));
-    assert!(worker_source.contains("handle_hackernews_function"));
-    assert!(worker_source.contains("https://hacker-news.firebaseio.com/v0/topstories.json"));
-    assert!(worker_source.contains("std::time::Duration::from_secs(12)"));
-    assert!(worker_source.contains("fn same_origin_url"));
-    assert!(worker_source.contains("origin(candidate) == origin(SOURCE_URL)"));
-    assert!(worker_source.contains("fn source_path"));
-    assert!(worker_source.contains("clean.starts_with('/')"));
-    assert!(!worker_source.contains("trim_start_matches(\"ai/\")"));
-    assert!(worker_source.contains("let query_empty = query.is_empty();"));
-    assert!(!worker_source.contains("handle_digg_function"));
-    assert!(!worker_source.contains("format_digg"));
-    assert!(!worker_source.contains("\"todo\": \"implement"));
-
-    let worker_cargo = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
-    assert!(worker_cargo.contains("ureq"));
-
-    let verified = verify_worker(VerifyWorkerInput {
-        output_dir: tmp.path().to_path_buf(),
-    })
-    .unwrap();
-    assert!(verified.ok);
-}
-
-#[test]
-fn generated_public_url_worker_reuses_live_template_without_new_cli_code() {
-    let tmp = tempfile::tempdir().unwrap();
-    let input = ArtifactInput {
-        name: "product hunt".into(),
-        goal: Some("daily launch tracking and maker lookup".into()),
-        source_type: Some(SourceType::Docs),
-        source: Some("https://www.producthunt.com".into()),
-        functions: vec![
-            "top_launches".into(),
-            "launch_details".into(),
-            "topic_search".into(),
+    let spec_path = tmp.path().join("demo.openapi.json");
+    std::fs::write(
+        &spec_path,
+        r#"{
+  "openapi": "3.0.0",
+  "info": { "title": "Demo API", "version": "1.0.0" },
+  "servers": [{ "url": "https://api.example.com/v1" }],
+  "paths": {
+    "/search": {
+      "get": {
+        "operationId": "search_items",
+        "summary": "Search items",
+        "parameters": [
+          { "name": "q", "in": "query", "required": true, "schema": { "type": "string" } }
         ],
-        output_dir: Some(tmp.path().to_path_buf()),
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          }
+        }
+      }
+    },
+    "/items/{id}": {
+      "get": {
+        "operationId": "read_item",
+        "summary": "Read item",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "ok" } }
+      }
+    }
+  }
+}"#,
+    )
+    .unwrap();
+    let iii = iii_sdk::register_worker("ws://localhost:1", artifact_worker::init_options());
+
+    let converted = convert_artifact_for_iii(
+        &iii,
+        ConvertArtifactInput {
+            name: Some("demo".into()),
+            source: Some(format!("  {}\n", spec_path.display())),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    iii.shutdown();
+
+    assert_eq!(converted.mode, "http_invocation");
+    assert_eq!(converted.namespace, "demo");
+    assert_eq!(converted.source_type, SourceType::OpenApi);
+    assert_eq!(
+        converted.source.as_deref(),
+        Some(spec_path.to_str().unwrap())
+    );
+    assert_eq!(converted.function_count, 2);
+    assert!(converted
+        .registered_functions
+        .iter()
+        .any(|function| function.function_id == "demo::search_items"
+            && function.method == "GET"
+            && function.url == "https://api.example.com/v1/search"));
+    assert!(converted
+        .registered_functions
+        .iter()
+        .any(|function| function.function_id == "demo::read_item"
+            && function.method == "GET"
+            && function.url == "https://api.example.com/v1/items/{id}"));
+}
+
+#[test]
+fn convert_accepts_openapi_yaml_specs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let spec_path = tmp.path().join("demo.openapi.yaml");
+    std::fs::write(
+        &spec_path,
+        r#"openapi: 3.0.0
+info:
+  title: Demo API
+  version: 1.0.0
+servers:
+  - url: https://api.example.com
+paths:
+  /status:
+    get:
+      operationId: read_status
+      summary: Read status
+      responses:
+        "200":
+          description: ok
+"#,
+    )
+    .unwrap();
+    let iii = iii_sdk::register_worker("ws://localhost:1", artifact_worker::init_options());
+
+    let converted = convert_artifact_for_iii(
+        &iii,
+        ConvertArtifactInput {
+            name: Some("demo".into()),
+            source: Some(spec_path.display().to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    iii.shutdown();
+
+    assert_eq!(converted.mode, "http_invocation");
+    assert_eq!(converted.source_type, SourceType::OpenApi);
+    assert!(converted
+        .registered_functions
+        .iter()
+        .any(|function| function.function_id == "demo::read_status"
+            && function.method == "GET"
+            && function.url == "https://api.example.com/status"));
+}
+
+#[test]
+fn convert_replaces_existing_http_invoked_functions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let spec_path = tmp.path().join("demo.openapi.json");
+    std::fs::write(
+        &spec_path,
+        r#"{
+  "openapi": "3.0.0",
+  "info": { "title": "Demo API", "version": "1.0.0" },
+  "servers": [{ "url": "https://api.example.com" }],
+  "paths": {
+    "/status": {
+      "get": {
+        "operationId": "read_status",
+        "summary": "Read status",
+        "responses": { "200": { "description": "ok" } }
+      }
+    }
+  }
+}"#,
+    )
+    .unwrap();
+    let iii = iii_sdk::register_worker("ws://localhost:1", artifact_worker::init_options());
+    let input = ConvertArtifactInput {
+        name: Some("replace demo".into()),
+        source: Some(spec_path.display().to_string()),
+        ..Default::default()
     };
 
-    let generated = generate_worker(input).unwrap();
-    let worker_source = std::fs::read_to_string(&generated.worker_path).unwrap();
-    assert!(worker_source.contains("handle_source_function"));
-    assert!(worker_source.contains("handle_producthunt_function"));
-    assert!(worker_source.contains("https://www.producthunt.com/feed"));
-    assert!(worker_source.contains("const SOURCE_NAME: &str = \"producthunt\";"));
-    assert!(
-        worker_source.contains("return producthunt_details(function_id, payload, reused_workers);")
+    let first = convert_artifact_for_iii(&iii, input.clone()).unwrap();
+    let second = convert_artifact_for_iii(&iii, input).unwrap();
+    iii.shutdown();
+
+    assert_eq!(first.mode, "http_invocation");
+    assert_eq!(second.mode, "http_invocation");
+    assert_eq!(second.function_count, 1);
+    assert_eq!(
+        second.registered_functions[0].function_id,
+        "replace_demo::read_status"
     );
-    assert!(worker_source.contains("fn producthunt_details"));
-    assert!(worker_source.contains("payload_text(&payload, &[\"id\", \"postId\", \"productId\"]);"));
-    assert!(worker_source.contains("source_top_items"));
-    assert!(worker_source.contains("source_search"));
-    assert!(worker_source.contains("const SOURCE_URL: &str = \"https://www.producthunt.com\";"));
-    assert!(!worker_source.contains("\"todo\": \"implement"));
-    assert!(!worker_source.contains("handle_digg_function"));
+}
 
-    let worker_cargo = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
-    assert!(worker_cargo.contains("ureq"));
+#[test]
+fn convert_registers_named_mcp_endpoint_functions() {
+    let iii = iii_sdk::register_worker("ws://localhost:1", artifact_worker::init_options());
 
-    let verified = verify_worker(VerifyWorkerInput {
-        output_dir: tmp.path().to_path_buf(),
-    })
+    let converted = convert_artifact_for_iii(
+        &iii,
+        ConvertArtifactInput {
+            name: Some("github mcp".into()),
+            source_type: Some(SourceType::Mcp),
+            source: Some("https://example.com/mcp".into()),
+            functions: vec!["search_repos".into(), "get_issue".into()],
+            ..Default::default()
+        },
+    )
     .unwrap();
-    assert!(verified.ok);
+    iii.shutdown();
+
+    assert_eq!(converted.mode, "http_invocation");
+    assert_eq!(converted.namespace, "github_mcp");
+    assert_eq!(converted.function_count, 2);
+    assert!(converted
+        .registered_functions
+        .iter()
+        .all(|function| function.method == "POST" && function.url == "https://example.com/mcp"));
+    assert!(converted
+        .registered_functions
+        .iter()
+        .any(|function| function.function_id == "github_mcp::search_repos"));
+}
+
+#[test]
+fn convert_discovers_mcp_http_tools() {
+    let url = spawn_mock_mcp_server(true);
+    let iii = iii_sdk::register_worker("ws://localhost:1", artifact_worker::init_options());
+
+    let converted = convert_artifact_for_iii(
+        &iii,
+        ConvertArtifactInput {
+            name: Some("docs mcp".into()),
+            source: Some(url.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    iii.shutdown();
+
+    assert_eq!(converted.mode, "http_invocation");
+    assert_eq!(converted.source_type, SourceType::Mcp);
+    assert_eq!(converted.namespace, "docs_mcp");
+    assert_eq!(converted.function_count, 2);
+    assert!(converted
+        .registered_functions
+        .iter()
+        .any(|function| function.function_id == "docs_mcp::search_docs"
+            && function.method == "POST"
+            && function.url == url));
+    assert!(converted
+        .registered_functions
+        .iter()
+        .any(|function| function.function_id == "docs_mcp::read_doc"));
+}
+
+#[test]
+fn convert_discovers_mcp_stdio_tools() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script_path = tmp.path().join("mcp-stdio.sh");
+    std::fs::write(
+        &script_path,
+        r#"read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"mock-stdio","version":"1.0.0"}}}'
+read -r line
+read -r line
+case "$line" in
+  *tools/list*)
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"search-docs","description":"Search docs over stdio","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},{"name":"read_doc","description":"Read doc over stdio","inputSchema":{"type":"object","properties":{"id":{"type":"string"}}}}]}}'
+    ;;
+  *tools/call*)
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"stdio ok"}]}}'
+    ;;
+  *)
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"unknown method"}}'
+    ;;
+esac
+"#,
+    )
+    .unwrap();
+    let iii = iii_sdk::register_worker("ws://localhost:1", artifact_worker::init_options());
+
+    let converted = convert_artifact_for_iii(
+        &iii,
+        ConvertArtifactInput {
+            name: Some("stdio docs".into()),
+            command: Some("sh".into()),
+            args: vec![script_path.display().to_string()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    iii.shutdown();
+
+    assert_eq!(converted.mode, "http_invocation");
+    assert_eq!(converted.source_type, SourceType::Mcp);
+    assert_eq!(converted.namespace, "stdio_docs");
+    assert_eq!(converted.function_count, 2);
+    assert!(converted
+        .source
+        .as_deref()
+        .is_some_and(|source| source.starts_with("stdio:sh ")));
+    assert!(converted
+        .registered_functions
+        .iter()
+        .any(|function| function.function_id == "stdio_docs::search_docs"
+            && function.method == "POST"
+            && function.url.starts_with("stdio:sh ")));
+    assert!(converted
+        .registered_functions
+        .iter()
+        .any(|function| function.function_id == "stdio_docs::read_doc"));
+}
+
+fn spawn_mock_mcp_server(use_sse_for_tools: bool) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(8).flatten() {
+            handle_mock_mcp_request(stream, use_sse_for_tools);
+        }
+    });
+    format!("http://{address}/mcp")
+}
+
+fn handle_mock_mcp_request(mut stream: std::net::TcpStream, use_sse_for_tools: bool) {
+    let body = read_http_body(&mut stream);
+    let value = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
+    let method = value.get("method").and_then(serde_json::Value::as_str);
+    let id = value.get("id").cloned().unwrap_or(serde_json::json!(1));
+    match method {
+        Some("initialize") => write_http_json(
+            &mut stream,
+            200,
+            Some("mock-session"),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": { "tools": { "listChanged": false } },
+                    "serverInfo": { "name": "mock", "version": "1.0.0" }
+                }
+            }),
+        ),
+        Some("notifications/initialized") => write_http_empty(&mut stream, 202),
+        Some("tools/list") => {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "tools": [
+                        {
+                            "name": "search-docs",
+                            "description": "Search docs",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": { "query": { "type": "string" } },
+                                "required": ["query"]
+                            },
+                            "outputSchema": {
+                                "type": "object",
+                                "properties": { "matches": { "type": "array" } }
+                            }
+                        },
+                        {
+                            "name": "read_doc",
+                            "description": "Read one doc",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": { "id": { "type": "string" } }
+                            }
+                        }
+                    ]
+                }
+            });
+            if use_sse_for_tools {
+                write_http_sse(&mut stream, response);
+            } else {
+                write_http_json(&mut stream, 200, None, response);
+            }
+        }
+        Some("tools/call") => write_http_json(
+            &mut stream,
+            200,
+            None,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{ "type": "text", "text": "ok" }]
+                }
+            }),
+        ),
+        _ => write_http_json(
+            &mut stream,
+            200,
+            None,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": "unknown method" }
+            }),
+        ),
+    }
+}
+
+fn read_http_body(stream: &mut std::net::TcpStream) -> String {
+    use std::io::Read;
+    let mut buffer = vec![0; 8192];
+    let mut received = Vec::new();
+    let mut content_length = None;
+    loop {
+        let read = stream.read(&mut buffer).unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        received.extend_from_slice(&buffer[..read]);
+        let request = String::from_utf8_lossy(&received);
+        if let Some(header_end) = request.find("\r\n\r\n") {
+            if content_length.is_none() {
+                content_length = request[..header_end]
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .and_then(|value| value.trim().parse::<usize>().ok());
+            }
+            let body_start = header_end + 4;
+            let expected = content_length.unwrap_or(0);
+            if received.len().saturating_sub(body_start) >= expected {
+                return String::from_utf8_lossy(&received[body_start..body_start + expected])
+                    .to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+fn write_http_json(
+    stream: &mut std::net::TcpStream,
+    status: u16,
+    session_id: Option<&str>,
+    body: serde_json::Value,
+) {
+    write_http_response(
+        stream,
+        status,
+        "application/json",
+        session_id,
+        &body.to_string(),
+    );
+}
+
+fn write_http_sse(stream: &mut std::net::TcpStream, body: serde_json::Value) {
+    write_http_response(
+        stream,
+        200,
+        "text/event-stream",
+        None,
+        &format!("event: message\ndata: {}\n\n", body),
+    );
+}
+
+fn write_http_empty(stream: &mut std::net::TcpStream, status: u16) {
+    write_http_response(stream, status, "text/plain", None, "");
+}
+
+fn write_http_response(
+    stream: &mut std::net::TcpStream,
+    status: u16,
+    content_type: &str,
+    session_id: Option<&str>,
+    body: &str,
+) {
+    use std::io::Write;
+    let status_text = if status == 202 { "Accepted" } else { "OK" };
+    let session_header = session_id
+        .map(|id| format!("Mcp-Session-Id: {id}\r\n"))
+        .unwrap_or_default();
+    let response = format!(
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\n{session_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).unwrap();
 }
