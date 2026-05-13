@@ -1,7 +1,0 @@
-{
-  "name": "digg",
-  "goal": "give agents focused read-only access to Digg AI top stories, AI 1000 rank lookup, story search, highlights, and pipeline status",
-  "sourceType": "docs",
-  "source": "https://di.gg/ai",
-  "functions": []
-}
