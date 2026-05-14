@@ -73,7 +73,7 @@ struct SpecSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct VirtualFunctionRegistration {
+pub struct GeneratedFunctionRegistration {
     pub function_id: String,
     pub url: String,
     pub method: String,
@@ -82,13 +82,13 @@ pub struct VirtualFunctionRegistration {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct VirtualWorkerManifest {
+pub struct GeneratedWorkerManifest {
     pub schema: String,
     pub worker_name: String,
     pub namespace: String,
     pub source_type: SourceType,
     pub source: Option<String>,
-    pub functions: Vec<VirtualFunctionRegistration>,
+    pub functions: Vec<GeneratedFunctionRegistration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -101,18 +101,18 @@ pub struct SpecToWorkerConversion {
     pub source_type: SourceType,
     pub source: Option<String>,
     pub function_count: usize,
-    pub registered_functions: Vec<VirtualFunctionRegistration>,
-    pub manifest: VirtualWorkerManifest,
+    pub registered_functions: Vec<GeneratedFunctionRegistration>,
+    pub manifest: GeneratedWorkerManifest,
     pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
-struct VirtualHttpFunction {
+struct GeneratedHttpFunction {
     function_id: String,
     url: String,
     method: HttpMethod,
     mcp_transport: Option<McpTransport>,
-    invocation: VirtualInvocation,
+    invocation: GeneratedInvocation,
     description: String,
     request_format: Option<Value>,
     response_format: Option<Value>,
@@ -120,7 +120,7 @@ struct VirtualHttpFunction {
 }
 
 #[derive(Debug, Clone)]
-enum VirtualInvocation {
+enum GeneratedInvocation {
     Http,
     McpTool { tool_name: String },
     McpToolsList,
@@ -167,7 +167,7 @@ struct McpListToolsResult {
 #[derive(Clone)]
 struct BridgeServer {
     base_url: String,
-    functions: Arc<Mutex<HashMap<String, VirtualHttpFunction>>>,
+    functions: Arc<Mutex<HashMap<String, GeneratedHttpFunction>>>,
 }
 
 struct BridgeRequest {
@@ -175,7 +175,7 @@ struct BridgeRequest {
     body: Vec<u8>,
 }
 
-static VIRTUAL_BRIDGE: OnceLock<Mutex<Option<BridgeServer>>> = OnceLock::new();
+static GENERATED_BRIDGE: OnceLock<Mutex<Option<BridgeServer>>> = OnceLock::new();
 static GENERATED_FUNCTION_REFS: OnceLock<Mutex<HashMap<String, FunctionRef>>> = OnceLock::new();
 
 pub fn registered_function_ids() -> Vec<&'static str> {
@@ -234,8 +234,8 @@ pub fn convert_spec_to_worker_for_iii(
 ) -> Result<SpecToWorkerConversion> {
     let spec = input.into_spec_source()?;
     match spec.source_type {
-        SourceType::OpenApi => register_openapi_virtual_worker(iii, spec),
-        SourceType::Mcp => register_mcp_virtual_worker(iii, spec),
+        SourceType::OpenApi => register_openapi_generated_worker(iii, spec),
+        SourceType::Mcp => register_mcp_generated_worker(iii, spec),
         other => Err(SpecToWorkerError::InvalidInput(format!(
             "spec-to-worker::convert supports open_api and mcp sources; got {other:?}"
         ))),
@@ -303,7 +303,7 @@ impl ConvertSpecToWorkerInput {
     }
 }
 
-fn register_openapi_virtual_worker(
+fn register_openapi_generated_worker(
     iii: &iii_sdk::III,
     spec_source: SpecSource,
 ) -> Result<SpecToWorkerConversion> {
@@ -312,31 +312,31 @@ fn register_openapi_virtual_worker(
     })?;
     let spec_text = fetch_text_for_conversion(source)?;
     let openapi_spec = parse_openapi_spec(&spec_text)?;
-    let virtual_functions = openapi_virtual_functions(&spec_source, source, &openapi_spec)?;
-    register_virtual_worker(iii, &spec_source, virtual_functions, "http_invocation")
+    let generated_functions = openapi_generated_functions(&spec_source, source, &openapi_spec)?;
+    register_generated_worker(iii, &spec_source, generated_functions, "http_invocation")
 }
 
-fn register_mcp_virtual_worker(
+fn register_mcp_generated_worker(
     iii: &iii_sdk::III,
     spec: SpecSource,
 ) -> Result<SpecToWorkerConversion> {
     let transport = mcp_transport_from_spec(&spec)?;
-    let virtual_functions = if spec.functions.is_empty() {
-        mcp_discovered_virtual_functions(&spec, &transport)?
+    let generated_functions = if spec.functions.is_empty() {
+        mcp_discovered_generated_functions(&spec, &transport)?
     } else {
-        mcp_named_virtual_functions(&spec, &transport)
+        mcp_named_generated_functions(&spec, &transport)
     };
-    register_virtual_worker(iii, &spec, virtual_functions, "http_invocation")
+    register_generated_worker(iii, &spec, generated_functions, "http_invocation")
 }
 
-fn register_virtual_worker(
+fn register_generated_worker(
     iii: &iii_sdk::III,
     spec: &SpecSource,
-    virtual_functions: Vec<VirtualHttpFunction>,
+    generated_functions: Vec<GeneratedHttpFunction>,
     mode: &str,
 ) -> Result<SpecToWorkerConversion> {
     let mut registered_functions = Vec::new();
-    for function in virtual_functions {
+    for function in generated_functions {
         let method_label = http_method_label(&function.method).to_string();
         let invocation_url = register_bridge_function(&function)?;
         let message = RegisterFunctionMessage {
@@ -366,7 +366,7 @@ fn register_virtual_worker(
         refs.insert(function.function_id.clone(), function_ref);
         drop(refs);
 
-        registered_functions.push(VirtualFunctionRegistration {
+        registered_functions.push(GeneratedFunctionRegistration {
             function_id: function.function_id,
             url: function.url,
             method: method_label,
@@ -374,7 +374,7 @@ fn register_virtual_worker(
         });
     }
 
-    let manifest = VirtualWorkerManifest {
+    let manifest = GeneratedWorkerManifest {
         schema: "spec-to-worker.http-invocation.v1".into(),
         worker_name: spec.worker_name.clone(),
         namespace: spec.namespace.clone(),
@@ -396,15 +396,17 @@ fn register_virtual_worker(
         notes: vec![
             "Registered functions are normal iii functions backed by engine HTTP invocation."
                 .into(),
+            "The engine lists the converted source as an engine-runtime worker group; no worker process is started."
+                .into(),
         ],
     })
 }
 
-fn openapi_virtual_functions(
+fn openapi_generated_functions(
     spec_source: &SpecSource,
     source: &str,
     openapi_spec: &Value,
-) -> Result<Vec<VirtualHttpFunction>> {
+) -> Result<Vec<GeneratedHttpFunction>> {
     let paths = openapi_spec
         .get("paths")
         .and_then(Value::as_object)
@@ -450,12 +452,12 @@ fn openapi_virtual_functions(
                 .unwrap_or("OpenAPI HTTP-invoked function")
                 .to_string();
             let parameters = openapi_parameters(&path_parameters, operation);
-            operations.push(VirtualHttpFunction {
+            operations.push(GeneratedHttpFunction {
                 function_id,
                 url: join_url_path(&base_url, path),
                 method: http_method,
                 mcp_transport: None,
-                invocation: VirtualInvocation::Http,
+                invocation: GeneratedInvocation::Http,
                 description,
                 request_format: Some(openapi_request_format(&parameters, operation)),
                 response_format: openapi_response_format(operation),
@@ -478,10 +480,10 @@ fn openapi_virtual_functions(
     Ok(operations)
 }
 
-fn mcp_discovered_virtual_functions(
+fn mcp_discovered_generated_functions(
     spec: &SpecSource,
     transport: &McpTransport,
-) -> Result<Vec<VirtualHttpFunction>> {
+) -> Result<Vec<GeneratedHttpFunction>> {
     let source = transport.source_label();
     let tools = mcp_list_tools(transport)?;
     if tools.is_empty() {
@@ -500,12 +502,12 @@ fn mcp_discovered_virtual_functions(
                 .clone()
                 .or_else(|| tool.title.clone())
                 .unwrap_or_else(|| format!("Call MCP tool {}.", tool.name));
-            VirtualHttpFunction {
+            GeneratedHttpFunction {
                 function_id,
                 url: source.clone(),
                 method: HttpMethod::Post,
                 mcp_transport: Some(transport.clone()),
-                invocation: VirtualInvocation::McpTool {
+                invocation: GeneratedInvocation::McpTool {
                     tool_name: tool.name.clone(),
                 },
                 description,
@@ -520,10 +522,10 @@ fn mcp_discovered_virtual_functions(
         .collect())
 }
 
-fn mcp_named_virtual_functions(
+fn mcp_named_generated_functions(
     spec: &SpecSource,
     transport: &McpTransport,
-) -> Vec<VirtualHttpFunction> {
+) -> Vec<GeneratedHttpFunction> {
     let source = transport.source_label();
     let mut seen = HashSet::new();
     spec.functions
@@ -532,22 +534,22 @@ fn mcp_named_virtual_functions(
             let local_name = function_local_name(function, &spec.namespace);
             let local_slug = slugify(&local_name);
             let invocation = match local_slug.as_str() {
-                "tools_list" => VirtualInvocation::McpToolsList,
-                "tool_call" => VirtualInvocation::McpToolCall,
-                _ => VirtualInvocation::McpTool {
+                "tools_list" => GeneratedInvocation::McpToolsList,
+                "tool_call" => GeneratedInvocation::McpToolCall,
+                _ => GeneratedInvocation::McpTool {
                     tool_name: local_name.clone(),
                 },
             };
             let metadata = match &invocation {
-                VirtualInvocation::McpTool { tool_name } => {
+                GeneratedInvocation::McpTool { tool_name } => {
                     spec_to_worker_metadata(spec, serde_json::json!({ "mcpTool": tool_name }))
                 }
-                VirtualInvocation::McpToolsList | VirtualInvocation::McpToolCall => {
+                GeneratedInvocation::McpToolsList | GeneratedInvocation::McpToolCall => {
                     spec_to_worker_metadata(spec, serde_json::json!({}))
                 }
-                VirtualInvocation::Http => spec_to_worker_metadata(spec, serde_json::json!({})),
+                GeneratedInvocation::Http => spec_to_worker_metadata(spec, serde_json::json!({})),
             };
-            VirtualHttpFunction {
+            GeneratedHttpFunction {
                 function_id: unique_function_id(&spec.namespace, local_slug, &mut seen),
                 url: source.clone(),
                 method: HttpMethod::Post,
@@ -582,7 +584,7 @@ fn spec_to_worker_metadata(spec: &SpecSource, extra: Value) -> Value {
     serde_json::json!({
         "spec": spec_meta,
         "iii": {
-            "virtualWorker": { "name": spec.worker_name }
+            "generatedWorker": { "name": spec.worker_name }
         }
     })
 }
@@ -1120,7 +1122,7 @@ fn openapi_response_format(operation: &serde_json::Map<String, Value>) -> Option
         .cloned()
 }
 
-fn register_bridge_function(function: &VirtualHttpFunction) -> Result<String> {
+fn register_bridge_function(function: &GeneratedHttpFunction) -> Result<String> {
     let bridge = bridge_server()?;
     let key = bridge_key(&function.function_id);
     bridge
@@ -1132,7 +1134,7 @@ fn register_bridge_function(function: &VirtualHttpFunction) -> Result<String> {
 }
 
 fn bridge_server() -> Result<BridgeServer> {
-    let slot = VIRTUAL_BRIDGE.get_or_init(|| Mutex::new(None));
+    let slot = GENERATED_BRIDGE.get_or_init(|| Mutex::new(None));
     let mut guard = slot
         .lock()
         .map_err(|_| SpecToWorkerError::InvalidInput("bridge server lock poisoned".into()))?;
@@ -1161,7 +1163,7 @@ fn bridge_server() -> Result<BridgeServer> {
 
 fn handle_bridge_connection(
     mut stream: TcpStream,
-    functions: Arc<Mutex<HashMap<String, VirtualHttpFunction>>>,
+    functions: Arc<Mutex<HashMap<String, GeneratedHttpFunction>>>,
 ) {
     let response = match read_bridge_request(&mut stream).and_then(|request| {
         let Some(key) = request.path.strip_prefix("/invoke/") else {
@@ -1180,7 +1182,7 @@ fn handle_bridge_connection(
         } else {
             serde_json::from_slice(&request.body)?
         };
-        invoke_virtual_http_function(&function, payload)
+        invoke_generated_http_function(&function, payload)
     }) {
         Ok(value) => (200, value),
         Err(error) => (
@@ -1249,24 +1251,27 @@ fn read_bridge_request(stream: &mut TcpStream) -> Result<BridgeRequest> {
     Ok(BridgeRequest { path, body })
 }
 
-fn invoke_virtual_http_function(function: &VirtualHttpFunction, payload: Value) -> Result<Value> {
+fn invoke_generated_http_function(
+    function: &GeneratedHttpFunction,
+    payload: Value,
+) -> Result<Value> {
     let payload = strip_iii_runtime_fields(payload);
     match &function.invocation {
-        VirtualInvocation::Http => invoke_plain_virtual_http_function(function, payload),
-        VirtualInvocation::McpTool { tool_name } => mcp_tool_call(
+        GeneratedInvocation::Http => invoke_plain_generated_http_function(function, payload),
+        GeneratedInvocation::McpTool { tool_name } => mcp_tool_call(
             function.mcp_transport.as_ref().ok_or_else(|| {
                 SpecToWorkerError::InvalidInput("MCP function is missing transport".into())
             })?,
             tool_name,
             payload,
         ),
-        VirtualInvocation::McpToolsList => {
+        GeneratedInvocation::McpToolsList => {
             mcp_list_tools(function.mcp_transport.as_ref().ok_or_else(|| {
                 SpecToWorkerError::InvalidInput("MCP function is missing transport".into())
             })?)
             .map(|tools| serde_json::json!({ "tools": tools }))
         }
-        VirtualInvocation::McpToolCall => {
+        GeneratedInvocation::McpToolCall => {
             let tool_name = payload.get("name").and_then(Value::as_str).ok_or_else(|| {
                 SpecToWorkerError::InvalidInput("MCP tool_call payload requires name".into())
             })?;
@@ -1285,17 +1290,17 @@ fn invoke_virtual_http_function(function: &VirtualHttpFunction, payload: Value) 
     }
 }
 
-fn invoke_plain_virtual_http_function(
-    function: &VirtualHttpFunction,
+fn invoke_plain_generated_http_function(
+    function: &GeneratedHttpFunction,
     payload: Value,
 ) -> Result<Value> {
-    let url = virtual_function_url(function, &payload);
-    let body = virtual_function_body(&payload);
-    let (status, text) = send_virtual_http(&function.method, &url, &body)?;
-    parse_virtual_http_response(status, text)
+    let url = generated_function_url(function, &payload);
+    let body = generated_function_body(&payload);
+    let (status, text) = send_generated_http(&function.method, &url, &body)?;
+    parse_generated_http_response(status, text)
 }
 
-fn send_virtual_http(method: &HttpMethod, url: &str, body: &Value) -> Result<(u16, String)> {
+fn send_generated_http(method: &HttpMethod, url: &str, body: &Value) -> Result<(u16, String)> {
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(30))
         .build();
@@ -1346,7 +1351,7 @@ fn send_virtual_http(method: &HttpMethod, url: &str, body: &Value) -> Result<(u1
     }
 }
 
-fn parse_virtual_http_response(status: u16, text: String) -> Result<Value> {
+fn parse_generated_http_response(status: u16, text: String) -> Result<Value> {
     if text.trim().is_empty() {
         return Ok(serde_json::json!({ "ok": status < 400, "status": status }));
     }
@@ -1360,7 +1365,7 @@ fn parse_virtual_http_response(status: u16, text: String) -> Result<Value> {
     }
 }
 
-fn virtual_function_url(function: &VirtualHttpFunction, payload: &Value) -> String {
+fn generated_function_url(function: &GeneratedHttpFunction, payload: &Value) -> String {
     let mut url = apply_path_parameters(&function.url, payload);
     if matches!(function.method, HttpMethod::Get) {
         let path_keys = path_parameter_names(&function.url);
@@ -1374,7 +1379,7 @@ fn virtual_function_url(function: &VirtualHttpFunction, payload: &Value) -> Stri
     url
 }
 
-fn virtual_function_body(payload: &Value) -> Value {
+fn generated_function_body(payload: &Value) -> Value {
     payload
         .get("body")
         .cloned()
@@ -1635,20 +1640,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn get_virtual_function_does_not_duplicate_path_params_in_query() {
-        let function = VirtualHttpFunction {
+    fn get_generated_function_does_not_duplicate_path_params_in_query() {
+        let function = GeneratedHttpFunction {
             function_id: "demo::get_story".into(),
             url: "http://127.0.0.1:18089/stories/{id}".into(),
             method: HttpMethod::Get,
             mcp_transport: None,
-            invocation: VirtualInvocation::Http,
+            invocation: GeneratedInvocation::Http,
             description: "Get story".into(),
             request_format: None,
             response_format: None,
             metadata: Value::Null,
         };
 
-        let url = virtual_function_url(
+        let url = generated_function_url(
             &function,
             &serde_json::json!({
                 "id": "42",
@@ -1657,5 +1662,32 @@ mod tests {
         );
 
         assert_eq!(url, "http://127.0.0.1:18089/stories/42?include=comments");
+    }
+
+    #[test]
+    fn metadata_carries_private_engine_group_hint_and_public_spec_details() {
+        let spec = SpecSource {
+            namespace: "docs_mcp".into(),
+            worker_name: "docs-mcp-worker".into(),
+            source_type: SourceType::Mcp,
+            source: Some("stdio:npx -y any-mcp-server".into()),
+            command: Some("npx".into()),
+            args: vec!["-y".into(), "any-mcp-server".into()],
+            env: HashMap::new(),
+            functions: vec![],
+        };
+
+        let metadata =
+            spec_to_worker_metadata(&spec, serde_json::json!({ "mcpTool": "search-docs" }));
+
+        assert_eq!(metadata["spec"]["mode"], "http_invocation");
+        assert_eq!(metadata["spec"]["sourceType"], "mcp");
+        assert_eq!(metadata["spec"]["namespace"], "docs_mcp");
+        assert_eq!(metadata["spec"]["workerName"], "docs-mcp-worker");
+        assert_eq!(metadata["spec"]["mcpTool"], "search-docs");
+        assert_eq!(
+            metadata["iii"]["generatedWorker"]["name"],
+            "docs-mcp-worker"
+        );
     }
 }

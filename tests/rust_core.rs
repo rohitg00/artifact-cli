@@ -107,6 +107,9 @@ fn convert_registers_openapi_json_as_http_invoked_functions() {
     iii.shutdown();
 
     assert_eq!(converted.mode, "http_invocation");
+    assert_eq!(converted.worker_name, "demo-worker");
+    assert_eq!(converted.manifest.worker_name, "demo-worker");
+    assert_eq!(converted.manifest.namespace, "demo");
     assert_eq!(converted.namespace, "demo");
     assert_eq!(converted.source_type, SourceType::OpenApi);
     assert_eq!(
@@ -126,6 +129,14 @@ fn convert_registers_openapi_json_as_http_invoked_functions() {
         .any(|function| function.function_id == "demo::read_item"
             && function.method == "GET"
             && function.url == "https://api.example.com/v1/items/{id}"));
+    assert!(converted
+        .notes
+        .iter()
+        .any(|note| note.contains("normal iii functions backed by engine HTTP invocation")));
+    assert!(converted
+        .notes
+        .iter()
+        .any(|note| note.contains("engine-runtime worker group; no worker process is started")));
 }
 
 #[test]
@@ -244,6 +255,41 @@ fn convert_registers_named_mcp_endpoint_functions() {
         .registered_functions
         .iter()
         .any(|function| function.function_id == "github_mcp::search_repos"));
+}
+
+#[test]
+fn conversion_response_describes_normal_engine_grouping_without_a_process() {
+    let iii = iii_sdk::register_worker("ws://localhost:1", spec_to_worker::init_options());
+
+    let converted = convert_spec_to_worker_for_iii(
+        &iii,
+        ConvertSpecToWorkerInput {
+            name: Some("docs mcp".into()),
+            source_type: Some(SourceType::Mcp),
+            source: Some("https://example.com/mcp".into()),
+            functions: vec!["search-docs".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    iii.shutdown();
+
+    assert_eq!(converted.mode, "http_invocation");
+    assert_eq!(converted.worker_name, "docs-mcp-worker");
+    assert_eq!(converted.namespace, "docs_mcp");
+    assert_eq!(converted.manifest.worker_name, "docs-mcp-worker");
+    assert_eq!(
+        converted.manifest.functions[0].function_id,
+        "docs_mcp::search_docs"
+    );
+    assert!(converted
+        .notes
+        .iter()
+        .any(|note| note.contains("normal iii functions backed by engine HTTP invocation")));
+    assert!(converted
+        .notes
+        .iter()
+        .any(|note| note.contains("engine-runtime worker group; no worker process is started")));
 }
 
 #[test]

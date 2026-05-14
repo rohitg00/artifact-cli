@@ -1,54 +1,44 @@
 # spec-to-worker
 
-Turn an OpenAPI spec or MCP server into normal iii functions.
+Turn OpenAPI specs and MCP servers into normal triggerable iii functions.
 
-`spec-to-worker` is the repo and binary name. The user-facing product is the
-`spec-to-worker::*` worker surface. Its main function is `spec-to-worker::convert`.
-
-The goal is simple:
+`spec-to-worker` exposes one public worker function:
 
 ```text
-OpenAPI or MCP input -> spec-to-worker::convert -> triggerable iii functions
+spec-to-worker::convert
 ```
 
-After conversion, every other worker calls the result with ordinary
-`iii trigger`. Callers do not need to know whether the function came from an
-OpenAPI operation, an MCP HTTP server, or an MCP stdio command.
+The conversion path is:
 
-## Why
+```text
+OpenAPI or MCP input -> spec-to-worker::convert -> engine HTTP-invoked iii functions
+```
 
-Large MCP tool lists and full API surfaces waste context. Agents usually need a
-small set of stable calls:
+After conversion, agents, users, and other workers call the generated functions
+with ordinary `iii trigger`. They do not need to know whether a function came
+from OpenAPI, MCP over HTTP, or MCP over stdio.
 
-- `context7_stdio::query_docs`
-- `context7_http::query_docs`
-- `xkcd_live::get_comicid_info_0_json`
-- `petstore::find_pets_by_status`
+## Product Contract
 
-Spec-to-worker makes those functions available through iii instead of asking the agent
-to inspect docs, pick tools from a huge list, or hand-wire API calls each time.
+Spec-to-worker is not a registry of hand-written integrations. It should work
+for any compatible OpenAPI document or MCP server the user provides.
 
-## Automatic Conversion Contract
-
-Spec-to-worker is not a prewritten integration collection. The normal path is:
-
-1. The user gives Spec-to-worker an OpenAPI URL, an MCP HTTP URL, or an MCP stdio
+1. The user provides an OpenAPI URL/file, an MCP HTTP URL, or an MCP stdio
    command.
 2. Spec-to-worker discovers the callable surface.
-3. Spec-to-worker registers the discovered surface as HTTP-invoked iii functions.
-4. Any worker triggers those functions normally.
+3. Spec-to-worker registers one iii function per operation or tool.
+4. The engine routes those functions through HTTP invocation.
+5. The engine lists the converted source as a normal engine-runtime worker group.
 
-No generated code is required for OpenAPI or MCP conversion.
+No generated worker process is started for converted sources. The grouping exists
+because it is useful to users browsing workers, but the functions are just normal
+engine functions.
 
-| Input | What Spec-to-worker discovers | What gets registered |
+| Input | Discovery | Registered output |
 | --- | --- | --- |
-| OpenAPI JSON/YAML | `paths`, operations, methods, params, request body schemas, response schemas | One iii function per operation |
-| MCP HTTP URL | MCP initialize plus `tools/list` | One iii function per MCP tool |
+| OpenAPI JSON/YAML | `paths`, operations, methods, params, request/response schemas | One iii function per operation |
+| MCP HTTP URL | MCP initialize and `tools/list` | One iii function per MCP tool |
 | MCP stdio command | Spawn command, initialize, `tools/list` | One iii function per MCP tool |
-
-The function IDs are generated from the source name and discovered operation or
-tool names. The caller supplies the source; Spec-to-worker handles discovery and
-registration.
 
 ## Current Status
 
@@ -57,22 +47,20 @@ Working locally:
 - OpenAPI JSON and YAML conversion
 - MCP HTTP tool discovery and invocation
 - MCP stdio tool discovery and invocation
-- Function replacement when the same spec is converted again
-- Hidden internal grouping inside the engine
-- Public `engine::functions::list` without internal metadata
-- Public `engine::workers::list` without generated worker entries
+- Function replacement when the same source is converted again
+- Public `engine::functions::list` without private `iii` metadata
+- Public `engine::workers::list` with generated engine-runtime worker groups
 
 Still pre-v1:
 
 - Auth handoff for protected OpenAPI endpoints is not done.
-- Write-capable APIs need a stricter safety policy before this should be used
-  broadly.
-- The paired iii engine changes must ship with spec-to-worker for the full
-  hidden-group behavior.
+- Write-capable APIs need a stricter safety policy before broad use.
+- The paired iii engine changes must ship with spec-to-worker for worker grouping
+  and trusted local bridge routing.
 
 ## Install
 
-From this repo:
+Build from this repo:
 
 ```bash
 cargo build
@@ -113,6 +101,7 @@ The response includes the registered iii functions:
 {
   "ok": true,
   "mode": "http_invocation",
+  "workerName": "xkcd-live-worker",
   "namespace": "xkcd_live",
   "functionCount": 2,
   "registeredFunctions": [
@@ -139,25 +128,14 @@ iii trigger \
   --timeout-ms 120000
 ```
 
-Real output from the current branch:
-
-```json
-{
-  "num": 614,
-  "title": "Woodpecker",
-  "safe_title": "Woodpecker",
-  "img": "https://imgs.xkcd.com/comics/woodpecker.png"
-}
-```
-
 ## Convert MCP Stdio
 
-Example using the Context7 MCP server through `npx`:
+Use any MCP stdio server command:
 
 ```bash
 iii trigger \
   --function-id spec-to-worker::convert \
-  --payload '{"name":"context7 stdio","sourceType":"mcp","command":"npx","args":["-y","@upstash/context7-mcp"]}' \
+  --payload '{"name":"docs mcp","sourceType":"mcp","command":"npx","args":["-y","some-mcp-server"]}' \
   --timeout-ms 180000
 ```
 
@@ -167,63 +145,41 @@ Spec-to-worker starts the command, calls `tools/list`, and registers each tool:
 {
   "ok": true,
   "mode": "http_invocation",
-  "namespace": "context7_stdio",
+  "workerName": "docs-mcp-worker",
+  "namespace": "docs_mcp",
   "functionCount": 2,
   "registeredFunctions": [
     {
-      "functionId": "context7_stdio::resolve_library_id",
+      "functionId": "docs_mcp::search_docs",
       "method": "POST",
-      "url": "stdio:npx -y @upstash/context7-mcp"
+      "url": "stdio:npx -y some-mcp-server"
     },
     {
-      "functionId": "context7_stdio::query_docs",
+      "functionId": "docs_mcp::read_doc",
       "method": "POST",
-      "url": "stdio:npx -y @upstash/context7-mcp"
+      "url": "stdio:npx -y some-mcp-server"
     }
   ]
 }
 ```
 
-Resolve React:
+Call a registered MCP tool through iii:
 
 ```bash
 iii trigger \
-  --function-id context7_stdio::resolve_library_id \
-  --payload '{"libraryName":"React","query":"React hooks useEffect documentation"}' \
+  --function-id docs_mcp::search_docs \
+  --payload '{"query":"React hooks cleanup"}' \
   --timeout-ms 180000
-```
-
-Then query docs:
-
-```bash
-iii trigger \
-  --function-id context7_stdio::query_docs \
-  --payload '{"libraryId":"/reactjs/react.dev","query":"React useEffect cleanup example"}' \
-  --timeout-ms 180000
-```
-
-Real output includes React docs snippets such as:
-
-```text
-React useEffect with setTimeout and Cleanup Function
-Subscribing to events with React Effect cleanup
-Fetching Data with React useEffect and Cleanup
 ```
 
 ## Convert MCP HTTP
 
-Run an MCP HTTP server:
-
-```bash
-npx -y @upstash/context7-mcp --transport http --port 18092
-```
-
-Convert it:
+Start any MCP HTTP server, then convert its endpoint:
 
 ```bash
 iii trigger \
   --function-id spec-to-worker::convert \
-  --payload '{"name":"context7 http","sourceType":"mcp","url":"http://127.0.0.1:18092/mcp"}' \
+  --payload '{"name":"docs http","sourceType":"mcp","url":"http://127.0.0.1:18092/mcp"}' \
   --timeout-ms 180000
 ```
 
@@ -231,22 +187,21 @@ Call the registered function:
 
 ```bash
 iii trigger \
-  --function-id context7_http::query_docs \
-  --payload '{"libraryId":"/reactjs/react.dev","query":"React useMemo example"}' \
+  --function-id docs_http::search_docs \
+  --payload '{"query":"React useMemo example"}' \
   --timeout-ms 180000
 ```
 
-Real output includes React `useMemo` snippets from Context7.
-
 ## Verify Visibility
 
-Converted functions should look like normal functions:
+Converted functions should look like normal functions. Public function metadata
+keeps the useful `spec` details and strips private engine fields:
 
 ```bash
 iii trigger \
   --function-id engine::functions::list \
   --payload '{"include_internal":false}' |
-  jq '[.functions[] | select(.function_id == "context7_stdio::query_docs") | {function_id, metadata}]'
+  jq '[.functions[] | select(.function_id == "docs_mcp::search_docs") | {function_id, metadata}]'
 ```
 
 Expected shape:
@@ -254,35 +209,44 @@ Expected shape:
 ```json
 [
   {
-    "function_id": "context7_stdio::query_docs",
+    "function_id": "docs_mcp::search_docs",
     "metadata": {
       "spec": {
-        "mcpTool": "query-docs",
+        "mcpTool": "search-docs",
         "mode": "http_invocation",
-        "namespace": "context7_stdio",
-        "source": "stdio:npx -y @upstash/context7-mcp",
+        "namespace": "docs_mcp",
+        "source": "stdio:npx -y some-mcp-server",
         "sourceType": "mcp",
-        "workerName": "context7-stdio-worker"
+        "workerName": "docs-mcp-worker"
       }
     }
   }
 ]
 ```
 
-Generated groups should not appear as public workers:
+The generated group should appear as a normal public worker entry:
 
 ```bash
 iii trigger \
   --function-id engine::workers::list \
   --payload '{}' |
-  jq '[.workers[] | select(.name == "context7-stdio-worker")]'
+  jq '[.workers[] | select(.name == "docs-mcp-worker")]'
 ```
 
-Expected output:
+Expected shape:
 
 ```json
-[]
+[
+  {
+    "name": "docs-mcp-worker",
+    "runtime": "engine",
+    "functions": ["docs_mcp::search_docs", "docs_mcp::read_doc"]
+  }
+]
 ```
+
+The exact worker fields depend on the engine version, but the entry should not
+expose a generated process, isolation runtime, or private grouping metadata.
 
 ## Public Payloads
 
@@ -290,10 +254,10 @@ Expected output:
 
 | Field | Required | Notes |
 | --- | --- | --- |
-| `name` | Usually | Human name used to create the function namespace. |
+| `name` | Usually | Human name used to create the namespace and worker group. |
 | `sourceType` | Recommended | Public conversion path is `open_api` or `mcp`. Obvious MCP URLs, MCP commands, and OpenAPI-looking filenames can be inferred. |
 | `url` / `source` | For OpenAPI and MCP HTTP | URL or local path for the input. `url` is accepted as an alias for `source`. |
-| `command` | For MCP stdio | Program to start, such as `npx`. |
+| `command` | For MCP stdio | Program to start, such as `npx`, `node`, or `python`. |
 | `args` | Optional | Command arguments for MCP stdio. |
 | `env` | Optional | Environment variables for MCP stdio. |
 | `functions` | Optional | MCP tool-name filter for advanced use. Omit it for full automatic tool discovery. |
@@ -309,11 +273,11 @@ Spec-to-worker normalizes names into iii-safe IDs:
 | Input | Function ID |
 | --- | --- |
 | `xkcd live` + `get /{comicId}/info.0.json` | `xkcd_live::get_comicid_info_0_json` |
-| `context7 stdio` + `query-docs` | `context7_stdio::query_docs` |
 | `docs mcp` + `search-docs` | `docs_mcp::search_docs` |
+| `github mcp` + `search_repos` | `github_mcp::search_repos` |
 
-If a duplicate ID appears during conversion, Spec-to-worker appends a numeric suffix.
-If the same spec is converted again, the old generated function ref is
+If a duplicate ID appears during conversion, spec-to-worker appends a numeric
+suffix. If the same source is converted again, the old generated function ref is
 unregistered and replaced.
 
 ## Developer Commands
@@ -323,20 +287,5 @@ cargo fmt
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
-
-## Real Checks Run On This Branch
-
-The current local branch was verified with:
-
-- `cargo test`
-- `cargo clippy --all-targets --all-features -- -D warnings`
-- iii engine hidden-group tests
-- `cargo check -p iii --tests`
-- live XKCD OpenAPI conversion and comic lookup
-- live Context7 MCP stdio conversion and React docs query
-- live Context7 MCP HTTP conversion and React docs query
-- duplicate conversion replacement for OpenAPI and MCP stdio
-- public function visibility check
-- public worker visibility check
 
 No release has been created from these changes yet.

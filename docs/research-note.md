@@ -1,6 +1,7 @@
 # Research note: automatic OpenAPI and MCP conversion
 
-Spec-to-worker should behave like an iii worker, not a local code generator.
+Spec-to-worker should behave like an iii worker that can convert arbitrary
+compatible sources into ordinary iii functions.
 
 The core path is:
 
@@ -12,25 +13,32 @@ OpenAPI or MCP input
   -> normal iii trigger calls from any worker
 ```
 
-## Product rule
+## Product Rule
 
-The public surface is one function: `spec-to-worker::convert`.
+The public source worker exposes one function: `spec-to-worker::convert`.
 
-Do not ask users to pick from prewritten integrations, edit generated files, or run a separate local CLI before they can call the result. For OpenAPI and MCP inputs, conversion should happen by discovery and registration.
+Do not ask users to pick from prewritten integrations, edit generated files, or
+run a separate local CLI before they can call the result. For OpenAPI and MCP
+inputs, conversion should happen through discovery and registration.
 
-## Engine rule
+## Engine Rule
 
-Spec-to-worker registers each discovered operation/tool through the engine HTTP invocation path. The internal grouping hint lives under `metadata.iii.virtualWorker`; the engine consumes and strips that hint before public function listing.
+Spec-to-worker registers each discovered operation or tool through the engine
+HTTP invocation path. The generated source should show up in
+`engine::workers::list` as a normal engine-runtime worker group because that
+grouping is useful externally.
 
-Users, workers, and agents should only see ordinary function ids such as:
+Users, workers, and agents should see ordinary function IDs such as:
 
 - `xkcd_live::get_comicid_info_0_json`
-- `context7_stdio::query_docs`
 - `docs_mcp::search_docs`
+- `github_mcp::search_repos`
 
-They should not need to know that those functions came from an internal grouped registration.
+Public function metadata should keep useful `spec` details and strip private
+engine routing fields. No engine code should special-case a specific MCP server,
+OpenAPI provider, or tool collection.
 
-## Scope now
+## Scope Now
 
 Supported:
 
@@ -38,8 +46,8 @@ Supported:
 - MCP over HTTP
 - MCP over stdio
 - duplicate conversion replacement
-- public metadata without internal `iii` fields
-- hidden internal grouping in `engine::workers::list`
+- public metadata without private `iii` fields
+- normal engine-runtime worker grouping for converted sources
 
 Not done yet:
 
